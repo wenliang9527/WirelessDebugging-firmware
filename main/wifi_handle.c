@@ -21,6 +21,7 @@
 #include "main/dap_cmd.h"
 #include "main/dap_config.h"
 #include "main/dap_version.h"
+#include "main/dap_led.h"
 #include "main/uart_bridge.h"
 
 #include "components/DAP/include/gpio_op.h"
@@ -43,13 +44,27 @@
 #elif defined CONFIG_IDF_TARGET_ESP32C3
     #define PIN_LED_WIFI_STATUS 10
 #elif defined CONFIG_IDF_TARGET_ESP32S3
-    /* 注意:板载 RGB LED 是 WS2812 接 GPIO48,不是普通 LED(见
-     * 01_hardware/开发板资料.md §3)。此处保留原值仅为不破坏上游编译,
-     * 状态指示将在 P2.5 用 RMT + led_strip 重做。 */
-    #define PIN_LED_WIFI_STATUS 4
+    /* 本板(YD-ESP32-S3)的 RGB LED 是 WS2812 接 GPIO48,不能用 GPIO 电平点。
+     * 状态指示统一由 dap_led.c 用 RMT 驱动;这里保留宏只为不破坏上游引用。 */
+    #define PIN_LED_WIFI_STATUS 48
+    #define USE_WS2812_STATUS_LED 1
 #else
     #error unknown hardware
 #endif
+
+/** 兼容宏:非 WS2812 板型仍走老的单色 LED 电平控制 */
+#ifndef USE_WS2812_STATUS_LED
+#define USE_WS2812_STATUS_LED 0
+#endif
+
+static inline void led_indicate(dap_led_state_t st)
+{
+#if USE_WS2812_STATUS_LED
+    dap_led_set(st);
+#else
+    (void)st;
+#endif
+}
 
 static const char *TAG = "wifi";
 
@@ -153,7 +168,7 @@ static esp_err_t event_handler(void *ctx, system_event_t *event) {
         break;
 
     case SYSTEM_EVENT_STA_GOT_IP:
-        GPIO_SET_LEVEL_HIGH(PIN_LED_WIFI_STATUS);
+        led_indicate(DAP_LED_STA_OK);
         xEventGroupSetBits(wifi_event_group, IPV4_GOTIP_BIT);
         ESP_LOGI(TAG, "STA got ip: %s", ip4addr_ntoa(&event->event_info.got_ip.ip_info.ip));
         if (s_manual) {
@@ -169,7 +184,9 @@ static esp_err_t event_handler(void *ctx, system_event_t *event) {
         break;
 
     case SYSTEM_EVENT_STA_DISCONNECTED:
-        GPIO_SET_LEVEL_LOW(PIN_LED_WIFI_STATUS);
+        /* 断连后仍在按列表轮转,所以是"连接中";只有整轮都失败才该报故障,
+         * 这里不区分那么细,统一用缓慢黄色闪烁提示"还没连上"。 */
+        led_indicate(DAP_LED_CONNECTING);
         ESP_LOGW(TAG, "disconnect reason: %d", (int)info->disconnected.reason);
 
 #ifdef CONFIG_IDF_TARGET_ESP8266
@@ -223,6 +240,7 @@ static esp_err_t event_handler(void *ctx, system_event_t *event) {
 
     case SYSTEM_EVENT_AP_START:
         ESP_LOGI(TAG, "AP started: ssid=%s", s_ap_ssid);
+        led_indicate(DAP_LED_AP_MODE);
         break;
 
     case SYSTEM_EVENT_AP_STACONNECTED:
@@ -544,8 +562,16 @@ esp_err_t dap_wifi_connect_manual(const char *ssid, const char *password) {
 /* ------------------------------------------------------------------ */
 
 static void wifi_hw_init_stage1(void) {
+#if USE_WS2812_STATUS_LED
+    /* WS2812 用 RMT 驱动,不能当普通 GPIO 配置(会破坏单总线时序)。
+     * 初始化失败只是没有灯,不影响 WiFi 与命令通道。 */
+    if (dap_led_init() != ESP_OK) {
+        ESP_LOGW(TAG, "status LED unavailable, continuing without it");
+    }
+#else
     GPIO_FUNCTION_SET(PIN_LED_WIFI_STATUS);
     GPIO_SET_DIRECTION_NORMAL_OUT(PIN_LED_WIFI_STATUS);
+#endif
 
     tcpip_adapter_init();
 
@@ -586,17 +612,27 @@ void wifi_init(void) {
     ssid_index = 0;
     ESP_ERROR_CHECK(esp_wifi_start());
 
+    /* 门闩在这里就该放开:esp_wifi_start() 返回时 WiFi 驱动已经可接受
+     * set_mode/stop,等 IP 只是"能不能上网",和"能不能切模式"无关。
+     *
+     * 早前把门闩放在"等到 IP 或超时"之后,导致开机后约 20 秒内 @MODE 一直
+     * 返回 405 wifi_still_starting —— 而那恰恰是最想切 AP 的场景。实测
+     * @STATUS 已经能正常返回时 @MODE 仍被拒,体验很怪。 */
+    dap_cmd_set_wifi_ready(true);
+    ESP_LOGI(TAG, "wifi driver ready; @MODE accepted from now on");
+
     ESP_LOGI(TAG, "waiting for AP connection...");
-    /* 不能无限等:连不上路由器时设备必须仍可被 @MODE 接管,
-     * 否则命令通道会被"永远卡在启动阶段"这个门闩挡死。
-     * 超时后放行命令通道,wifi 轮转会继续在后台重试。 */
+    led_indicate(DAP_LED_CONNECTING);
+    /* 这里只是"顺便等一会儿再放行 @SCAN 之类",超时不影响命令通道。 */
     EventBits_t bits = xEventGroupWaitBits(wifi_event_group, IPV4_GOTIP_BIT,
                                            false, true, pdMS_TO_TICKS(STA_BOOT_WAIT_MS));
     if (bits & IPV4_GOTIP_BIT) {
         ESP_LOGI(TAG, "connected");
     } else {
-        ESP_LOGW(TAG, "no AP within %d ms; keeping STA retry in background, "
-                      "command channel now accepts @MODE", STA_BOOT_WAIT_MS);
+        ESP_LOGW(TAG, "no AP within %d ms; keeping STA retry in background",
+                 STA_BOOT_WAIT_MS);
+        /* 启动阶段一直没连上:红色快闪,和"正在连接"区分开。
+         * 后台仍会继续轮转,连上后 GOT_IP 会把灯改成绿色常亮。 */
+        led_indicate(DAP_LED_FAULT);
     }
-    dap_cmd_set_wifi_ready(true);
 }
