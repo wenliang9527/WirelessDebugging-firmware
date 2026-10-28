@@ -9,6 +9,7 @@
 #include "sdkconfig.h"
 
 #include "main/dap_led.h"
+#include "main/dap_config.h"
 
 #if defined CONFIG_IDF_TARGET_ESP32S3
 
@@ -28,8 +29,12 @@ static const char *TAG = "dap.led";
 #define LED_COUNT           1
 #define LED_RMT_CHANNEL     RMT_CHANNEL_0
 
-/* 亮度限幅:WS2812 全亮刺眼且费电,15% 足够看清 */
-#define LED_BRIGHTNESS_PCT  15
+/* 亮度:运行时从配置层取,可用 @LED 命令调,存 NVS 重启后保持。
+ *
+ * 为什么默认值这么低(4%):WS2812 是高亮 LED,人眼对亮度是非线性感知的,
+ * 15% 的绿色(=38/255 PWM)在室内已经明显刺眼。要拿它当"状态指示"而不是
+ * 照明,4% 左右刚好——暗处能看清,又不至于盯着难受。 */
+static volatile uint8_t s_pct = DAP_CFG_LED_DEFAULT_PCT;
 
 #define LED_TASK_STACK      2560
 #define LED_TASK_PRIO       3
@@ -39,10 +44,10 @@ static led_strip_t *s_strip = NULL;
 static volatile dap_led_state_t s_state = DAP_LED_BOOT;
 static volatile bool s_run = false;
 
-/** 按百分比缩放单通道 */
+/** 按当前亮度百分比缩放单通道 */
 static inline uint32_t scale(uint32_t v)
 {
-    return (v * LED_BRIGHTNESS_PCT) / 100u;
+    return (v * (uint32_t)s_pct) / 100u;
 }
 
 /**
@@ -128,6 +133,13 @@ esp_err_t dap_led_init(void)
         return ESP_OK;
     }
 
+    /* 亮度来自配置层(NVS),没配过就用默认值 */
+    uint8_t pct = dap_config_get_led_brightness();
+    if (pct < DAP_CFG_LED_MIN_PCT || pct > DAP_CFG_LED_MAX_PCT) {
+        pct = DAP_CFG_LED_DEFAULT_PCT;
+    }
+    s_pct = pct;
+
     /* 用带 gpio 参数的这个入口:同版本的 led_strip_new_rmt_ws2812() 只收
      * channel/max_leds,不知道怎么指定数据脚,别用错。 */
     s_strip = led_strip_init((uint8_t)LED_RMT_CHANNEL, LED_GPIO, LED_COUNT);
@@ -152,8 +164,24 @@ esp_err_t dap_led_init(void)
     }
 
     ESP_LOGI(TAG, "WS2812 status LED on GPIO%d (%d%%)",
-             LED_GPIO, LED_BRIGHTNESS_PCT);
+             LED_GPIO, (int)s_pct);
     return ESP_OK;
+}
+
+void dap_led_set_brightness(uint8_t pct)
+{
+    if (pct < DAP_CFG_LED_MIN_PCT) {
+        pct = DAP_CFG_LED_MIN_PCT;
+    } else if (pct > DAP_CFG_LED_MAX_PCT) {
+        pct = DAP_CFG_LED_MAX_PCT;
+    }
+    /* 只改这个变量:动画任务下一拍就会用新亮度重画,不必重建 RMT。 */
+    s_pct = pct;
+}
+
+uint8_t dap_led_get_brightness(void)
+{
+    return s_pct;
 }
 
 void dap_led_set(dap_led_state_t state)
@@ -179,5 +207,7 @@ esp_err_t dap_led_init(void) { return ESP_ERR_NOT_SUPPORTED; }
 void dap_led_set(dap_led_state_t state) { (void)state; }
 void dap_led_off(void) { }
 bool dap_led_available(void) { return false; }
+void dap_led_set_brightness(uint8_t pct) { (void)pct; }
+uint8_t dap_led_get_brightness(void) { return 0; }
 
 #endif

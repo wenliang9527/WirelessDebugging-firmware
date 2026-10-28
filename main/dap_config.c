@@ -30,6 +30,7 @@ static const char *TAG = "dap.cfg";
 #define NVS_NS          "dap_cfg"
 #define KEY_COUNT       "count"
 #define KEY_MODE        "mode"
+#define KEY_LED_PCT     "led_pct"
 
 /* NVS 键名缓冲区:足够容纳 "ap<4>_ssid" / "ap<4>_pass" */
 #define KEY_BUF_LEN     24
@@ -40,6 +41,7 @@ static int  s_count = 0;
 static bool s_ready = false;
 static bool s_factory = true;   /* true = 用的是编译期出厂列表 */
 static uint8_t s_mode_pref = 0; /* 0=STA 1=AP */
+static uint8_t s_led_pct = DAP_CFG_LED_DEFAULT_PCT;
 
 /* ------------------------------------------------------------------ */
 
@@ -80,6 +82,14 @@ static bool load_from_nvs(void) {
     nvs_handle_t h;
     if (nvs_open(NVS_NS, NVS_READONLY, &h) != ESP_OK) {
         return false;
+    }
+
+    /* 亮度是独立偏好:即使一条用户网络都没存,也要读出来。
+     * 早退之前先处理掉,避免"只改了亮度、没配网"时设置丢失。 */
+    uint8_t pct = 0;
+    if (nvs_get_u8(h, KEY_LED_PCT, &pct) == ESP_OK &&
+        pct >= DAP_CFG_LED_MIN_PCT && pct <= DAP_CFG_LED_MAX_PCT) {
+        s_led_pct = pct;
     }
 
     uint8_t cnt = 0;
@@ -164,6 +174,10 @@ static esp_err_t save_all(void) {
         goto done;
     }
     err = nvs_set_u8(h, KEY_MODE, s_mode_pref);
+    if (err != ESP_OK) {
+        goto done;
+    }
+    err = nvs_set_u8(h, KEY_LED_PCT, s_led_pct);
     if (err != ESP_OK) {
         goto done;
     }
@@ -278,6 +292,7 @@ esp_err_t dap_config_factory_reset(void) {
 
     s_count = 0;
     s_mode_pref = 0;
+    s_led_pct = DAP_CFG_LED_DEFAULT_PCT;   /* 亮度也回默认 */
     load_factory_list();
     return err;
 }
@@ -303,4 +318,33 @@ esp_err_t dap_config_set_mode_pref(uint8_t mode) {
 
 uint8_t dap_config_get_mode_pref(void) {
     return s_mode_pref;
+}
+
+/* ------------------------------------------------------------------ */
+/* 状态灯亮度                                                          */
+/* ------------------------------------------------------------------ */
+
+esp_err_t dap_config_set_led_brightness(uint8_t pct) {
+    if (pct < DAP_CFG_LED_MIN_PCT || pct > DAP_CFG_LED_MAX_PCT) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    s_led_pct = pct;
+
+    /* 亮度是独立键,单独写一个就够了 —— 不必整表重写。
+     * 也刻意不受 s_factory 限制:哪怕没配过网,亮度也该能存下来。 */
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NVS_NS, NVS_READWRITE, &h);
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = nvs_set_u8(h, KEY_LED_PCT, s_led_pct);
+    if (err == ESP_OK) {
+        err = nvs_commit(h);
+    }
+    nvs_close(h);
+    return err;
+}
+
+uint8_t dap_config_get_led_brightness(void) {
+    return s_led_pct;
 }

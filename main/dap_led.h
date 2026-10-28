@@ -42,4 +42,13 @@ void dap_led_off(void);
 /** LED 是否真的可用(供 @STATUS 之类上报) */
 bool dap_led_available(void);
 
+/**
+ * 运行时改亮度(1..100,超出范围自动夹紧)。
+ * 立即生效,但**不落盘** —— 要持久化请走 @LED <pct>(它同时写 NVS)。
+ */
+void dap_led_set_brightness(uint8_t pct);
+
+/** 当前生效亮度百分比 */
+uint8_t dap_led_get_brightness(void);
+
 #endif

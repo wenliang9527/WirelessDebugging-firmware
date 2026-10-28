@@ -54,6 +54,18 @@ esp_err_t dap_config_factory_reset(void);
 esp_err_t dap_config_set_mode_pref(uint8_t mode);   /* 0=STA 1=AP */
 uint8_t   dap_config_get_mode_pref(void);
 
+/**
+ * 状态灯亮度(百分比 1..100)。
+ * 存在 NVS 里,重启后保持 —— 免得为"调暗一点"每次重烧固件。
+ * 默认 DAP_CFG_LED_DEFAULT_PCT。
+ */
+#define DAP_CFG_LED_DEFAULT_PCT  4
+#define DAP_CFG_LED_MIN_PCT      1
+#define DAP_CFG_LED_MAX_PCT      100
+
+esp_err_t dap_config_set_led_brightness(uint8_t pct);
+uint8_t   dap_config_get_led_brightness(void);
+
 #ifdef __cplusplus
 }
 #endif

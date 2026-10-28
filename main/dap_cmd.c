@@ -28,6 +28,7 @@
 
 #include "main/dap_cmd.h"
 #include "main/dap_config.h"
+#include "main/dap_led.h"
 #include "main/dap_version.h"
 #include "main/wifi_configuration.h"
 #include "main/wifi_handle.h"
@@ -438,6 +439,47 @@ static void cmd_mode(const char *args) {
     }
 }
 
+/**
+ * @LED [pct]
+ *
+ * 不带参数:查询当前亮度。
+ * 带参数:设置亮度 1..100 并写入 NVS(重启后保持)。
+ *
+ * 加这条命令是为了"灯太亮"这类主观偏好能当场调,不必为改一个数字重烧固件。
+ */
+static void cmd_led(const char *args) {
+    if (!dap_led_available()) {
+        dap_cmd_err(DAP_ERR_INTERNAL, "led_unavailable");
+        return;
+    }
+
+    char v[8] = {0};
+    if (!args || sscanf(args, "%7s", v) != 1) {
+        dap_cmd_ok("led pct=%d", (int)dap_led_get_brightness());
+        return;
+    }
+
+    char *end = NULL;
+    long pct = strtol(v, &end, 10);
+    if (end == v || (end && *end != '\0')) {
+        dap_cmd_err(DAP_ERR_BADARG, "pct_must_be_number");
+        return;
+    }
+    if (pct < DAP_CFG_LED_MIN_PCT || pct > DAP_CFG_LED_MAX_PCT) {
+        dap_cmd_err(DAP_ERR_BADARG, "pct_out_of_range_1_100");
+        return;
+    }
+
+    dap_led_set_brightness((uint8_t)pct);
+    esp_err_t err = dap_config_set_led_brightness((uint8_t)pct);
+    if (err != ESP_OK) {
+        /* 亮度已经生效了,只是没存下来 —— 如实告知,别报成功 */
+        dap_cmd_err(DAP_ERR_INTERNAL, "applied_but_not_saved");
+        return;
+    }
+    dap_cmd_ok("led pct=%d saved", (int)pct);
+}
+
 /* ------------------------------------------------------------------ */
 /* 分发                                                                */
 /* ------------------------------------------------------------------ */
@@ -455,6 +497,7 @@ static const cmd_entry_t s_cmds[] = {
     { "LIST",    cmd_list    },
     { "DEL",     cmd_del     },
     { "MODE",    cmd_mode    },
+    { "LED",     cmd_led     },
     { "FACTORY", cmd_factory },
     { "REBOOT",  cmd_reboot  },
 };
