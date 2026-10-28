@@ -285,7 +285,25 @@ static void ssid_change(void) {
     snprintf((char *)wifi_config.sta.password, sizeof(wifi_config.sta.password), "%.63s", ap.password);
     ESP_LOGI(TAG, "trying ssid[%d/%d]: %s", ssid_index, n, wifi_config.sta.ssid);
     ssid_index++;
-    ESP_ERROR_CHECK(esp_wifi_set_config(ESP_IF_WIFI_STA, &wifi_config));
+
+    /* 绝对不能用 ESP_ERROR_CHECK:它在失败时直接 abort,整块板子 panic 重启。
+     *
+     * 实测崩溃现场(2026-10-28):
+     *   assert failed: esp_wifi_set_config(ESP_IF_WIFI_STA, &wifi_config)
+     *   abort() was called at PC 0x40382177 on core 0
+     *
+     * 触发条件:WiFi 驱动正处于连接中/扫描中时,set_config 返回
+     * ESP_ERR_WIFI_STATE。而 ssid_change() 恰恰是在 STA_DISCONNECTED 回调
+     * 里被调用的 —— 那一刻驱动正在从断开态往重连态过渡,状态极不稳定。
+     * 于是"换个网络试试"这个最普通的动作能把板子打崩。
+     *
+     * 正确做法:失败就跳过这一轮。下一次 DISCONNECTED 事件会再来一次,
+     * 驱动那时通常已稳定。宁可少试一轮,也不能崩。 */
+    esp_err_t cfg_err = esp_wifi_set_config(ESP_IF_WIFI_STA, &wifi_config);
+    if (cfg_err != ESP_OK) {
+        ESP_LOGW(TAG, "set_config(%s) failed: %s; skip this round",
+                 wifi_config.sta.ssid, esp_err_to_name(cfg_err));
+    }
 }
 
 /* ------------------------------------------------------------------ */
