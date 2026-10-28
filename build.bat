@@ -53,6 +53,23 @@ if not exist "%IDF_PYTHON%" (
     goto :fail
 )
 
+REM --- Credential file change detection --------------------------------------
+REM wifi_credentials.h is optional and pulled in via __has_include, so the
+REM compiler never records "file absent" as a dependency. Adding or removing it
+REM would otherwise silently reuse the previous object files. Touch the sources
+REM that embed the SSID list to force a rebuild when its presence changes.
+set CRED_MARK=.cred_state
+set CRED_NOW=absent
+if exist "main\wifi_credentials.h" set CRED_NOW=present
+set CRED_PREV=absent
+if exist "%CRED_MARK%" set /p CRED_PREV=<"%CRED_MARK%"
+if not "%CRED_NOW%"=="%CRED_PREV%" (
+    echo [build.bat] wifi_credentials.h changed ^(%CRED_PREV% -^> %CRED_NOW%^), forcing rebuild
+    if exist "main\main.c" copy /b "main\main.c"+,, "main\main.c" >nul
+    if exist "main\wifi_handle.c" copy /b "main\wifi_handle.c"+,, "main\wifi_handle.c" >nul
+    >"%CRED_MARK%" echo %CRED_NOW%
+)
+
 REM --- Build ------------------------------------------------------------------
 echo [build.bat] IDF_PATH = %IDF_PATH%
 echo [build.bat] Python   = %IDF_PYTHON%

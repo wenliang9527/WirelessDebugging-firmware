@@ -7,3 +7,4 @@ sdkconfig.old
 
 # 本地私有 WiFi 凭据,不要提交(见 main/wifi_credentials.h.example)
 main/wifi_credentials.h
+.cred_state
