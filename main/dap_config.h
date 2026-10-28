@@ -44,6 +44,21 @@ esp_err_t dap_config_add(const char *ssid, const char *password);
 /** 删除第 idx 条(0 起) */
 esp_err_t dap_config_del(int idx);
 
+/**
+ * 把第 idx 条移到最前(优先级最高),其余顺序不变。
+ *
+ * 为什么需要它:@CONNECT 成功会自动把目标网络置顶,所以"最近连过的"
+ * 永远排第一。想让某条固定优先,光调一次顺序不够 —— 下次手动连别的
+ * 网络又会被顶下去。这个接口配合 @PRIORITIZE 提供显式排序能力。
+ */
+esp_err_t dap_config_prioritize(int idx);
+
+/**
+ * 排名查询:返回 ssid 在列表中的位置,未找到返回 -1。
+ * 供 @STATUS/@LIST 之外的诊断使用。
+ */
+int dap_config_index_of(const char *ssid);
+
 /** 是否正在使用编译期出厂列表(即 NVS 里没有任何用户配置) */
 bool dap_config_using_factory(void);
 

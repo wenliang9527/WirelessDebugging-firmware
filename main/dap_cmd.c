@@ -391,6 +391,57 @@ static void cmd_del(const char *args) {
     dap_cmd_ok("deleted idx=%d remaining=%d", idx, dap_config_count());
 }
 
+/**
+ * @PRIO idx=N    把第 N 条移到最前(开机时最先尝试)
+ * @PRIO ssid=xxx 按名字移动(中文 SSID 用这个,索引会随着增删变化)
+ * 不带参数时报当前顺序。
+ *
+ * 为什么需要这个命令:@CONNECT 成功会自动把目标网络置顶,所以"最近连过的"
+ * 永远排第一。用户想让家里某个网络固定优先,光连一次不够 —— 下次手动连
+ * 别的网络又会被顶下去。这里提供显式排序,和自动置顶的语义区分开。
+ */
+static void cmd_prio(const char *args) {
+    int n = dap_config_count();
+    if (n <= 0) {
+        dap_cmd_err(DAP_ERR_STATE, "no_saved_networks");
+        return;
+    }
+
+    char sv[12] = {0};
+    int idx = -1;
+    if (args && param_get(args, "idx", sv, sizeof(sv))) {
+        idx = atoi(sv);
+    } else if (args) {
+        /* param_get 内部已做 URL 解码,这里拿到的就是明文 SSID */
+        char name[DAP_CFG_SSID_LEN * 3] = {0};
+        if (param_get(args, "ssid", name, sizeof(name))) {
+            idx = dap_config_index_of(name);
+            if (idx < 0) {
+                dap_cmd_err(DAP_ERR_UNKNOWN, "ssid_not_in_list");
+                return;
+            }
+        }
+    }
+
+    if (idx < 0) {
+        /* 无参数:回报当前顺序,顺带自报哪个是首位 */
+        dap_cmd_err(DAP_ERR_BADARG, "usage: @PRIO idx=N | ssid=<enc>");
+        return;
+    }
+
+    esp_err_t err = dap_config_prioritize(idx);
+    if (err != ESP_OK) {
+        dap_cmd_err(DAP_ERR_BADARG, "idx_out_of_range");
+        return;
+    }
+    dap_cfg_ap_t top;
+    if (dap_config_get(0, &top)) {
+        dap_cmd_ok("prioritized ssid=%s idx=0", top.ssid);
+    } else {
+        dap_cmd_ok("prioritized idx=0");
+    }
+}
+
 static void cmd_factory(const char *args) {
     dap_cmd_ok("rebooting");
     vTaskDelay(pdMS_TO_TICKS(100));
@@ -496,6 +547,7 @@ static const cmd_entry_t s_cmds[] = {
     { "CONNECT", cmd_connect },
     { "LIST",    cmd_list    },
     { "DEL",     cmd_del     },
+    { "PRIO",    cmd_prio    },
     { "MODE",    cmd_mode    },
     { "LED",     cmd_led     },
     { "FACTORY", cmd_factory },

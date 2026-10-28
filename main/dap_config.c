@@ -273,6 +273,36 @@ esp_err_t dap_config_del(int idx) {
     return save_all();
 }
 
+esp_err_t dap_config_prioritize(int idx) {
+    if (idx < 0 || idx >= s_count) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (idx == 0) {
+        return ESP_OK;  /* 已经在最前,不必写 NVS */
+    }
+    /* 抽出来再前插,其余元素的相对顺序保持不变。
+     * 注意是"稳定"移动:别用整体排序,否则同优先级的相对次序会被打乱,
+     * 用户看到的列表会莫名其妙地跳动。 */
+    dap_cfg_ap_t tmp = s_aps[idx];
+    for (int i = idx; i > 0; i--) {
+        s_aps[i] = s_aps[i - 1];
+    }
+    s_aps[0] = tmp;
+    return save_all();
+}
+
+int dap_config_index_of(const char *ssid) {
+    if (!ssid || ssid[0] == '\0') {
+        return -1;
+    }
+    for (int i = 0; i < s_count; i++) {
+        if (strcmp(s_aps[i].ssid, ssid) == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
 bool dap_config_using_factory(void) {
     return s_factory;
 }
