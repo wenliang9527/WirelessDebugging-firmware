@@ -23,6 +23,31 @@ CONFIG_ESP32S3_INSTRUCTION_CACHE_32KB=y
 CONFIG_ESP32S3_INSTRUCTION_CACHE_LINE_32B=y
 CONFIG_ESP32S3_INSTRUCTION_CACHE_WRAP=y
 
+# --- Flash size: 16MB, and do NOT let esptool re-detect ----------------------
+# YD-ESP32-S3 (ESP32-S3-WROOM-1-N16R8) carries a 16MB flash. Kconfig's default
+# is 2MB (an ESP8266-era number), so leaving it alone used to put flash_size=2MB
+# into the bootloader image header.
+#
+# Why that produced a scary line at every boot:
+#   The bootloader image ends with a SHA-256 over its own body, and that digest
+#   covers the header. With CONFIG_ESPTOOLPY_FLASHSIZE_DETECT=y, esptool probes
+#   the real chip (16MB), rewrites header byte 3 (0x1f -> 0x4f) right before
+#   writing -- and never recomputes the appended digest. So flash then held an
+#   image whose body hashed to something the trailing 32 bytes did not describe,
+#   and the ROM printed:
+#       SHA-256 comparison failed: Calculated ... Expected ... Attempting to boot anyway...
+#   Nothing was broken; the image still booted. But the integrity check was
+#   permanently useless, and the log lied about it on every single boot.
+#
+# Declaring the real size makes the header already correct, so esptool's patch
+# becomes a no-op and the digest keeps matching.
+# If you port this to a board with different flash (e.g. N8R8 = 8MB), change
+# this value -- leaving DETECT off is deliberate: detection silently rewrites a
+# hashed header instead of failing loudly.
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
+# CONFIG_ESPTOOLPY_FLASHSIZE_DETECT is not set
+
 # --- Productization P1: console primary channel -> USB-Serial/JTAG -----------
 # IDF's "secondary console" mode is output-only and accepts no input
 # (esp_system/Kconfig: "only supports non-blocking mode without using REPL";
