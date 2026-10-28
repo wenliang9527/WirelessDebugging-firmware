@@ -10,18 +10,36 @@
 #ifndef __WIFI_CONFIGURATION__
 #define __WIFI_CONFIGURATION__
 
+/**
+ * WiFi 凭据来源:
+ *   - 若存在 main/wifi_credentials.h(本地私有,已 .gitignore),用里面的列表
+ *   - 否则回落到下面的出厂默认列表(DAP / OTA)
+ *
+ * 这样真实 WiFi 密码不会进入版本历史;开源发布出去的是出厂默认列表。
+ */
+#if defined(__has_include)
+#  if __has_include("main/wifi_credentials.h")
+#    include "main/wifi_credentials.h"
+#    define WIFI_LIST_IS_FACTORY_DEFAULT 0
+#  endif
+#endif
+
+#ifndef WIFI_LIST_IS_FACTORY_DEFAULT
+#define WIFI_LIST_IS_FACTORY_DEFAULT 1
 
 static struct {
     const char *ssid;
     const char *password;
 } wifi_list[] __attribute__((unused)) = {
-    {.ssid = "OTA", .password = "12345678"},
+    // 出厂默认:与上游一致,配合手机/PC 热点使用
+    // 产品化阶段(P2)后,这份列表降级为"无 NVS 配置时的初始候选"
     {.ssid = "DAP", .password = "12345678"},
-    // Add your WAP like this:
-    // {.ssid = "your ssid", .password = "your password"},
+    {.ssid = "OTA", .password = "12345678"},
 };
 
 #define WIFI_LIST_SIZE (sizeof(wifi_list) / sizeof(wifi_list[0]))
+
+#endif // WIFI_LIST_IS_FACTORY_DEFAULT
 
 #define USE_MDNS       1
 // Use the address "dap.local" to access the device
@@ -29,7 +47,7 @@ static struct {
 #define MDNS_INSTANCE "DAP mDNS"
 //
 
-#define USE_STATIC_IP 1
+#define USE_STATIC_IP 0
 // If you don't want to specify the ip configuration, then ignore the following items.
 #define DAP_IP_ADDRESS 192, 168, 137, 123
 #define DAP_IP_GATEWAY 192, 168, 137, 1
@@ -38,9 +56,11 @@ static struct {
 
 #define USE_OTA              0
 
-#define USE_UART_BRIDGE      0
+#define USE_UART_BRIDGE      1
 #define UART_BRIDGE_PORT     1234
-#define UART_BRIDGE_BAUDRATE 74880
+#define UART_BRIDGE_BAUDRATE 115200
+// 串口桥 TCP:1234 <-> S3 UART1(GPIO17=TX / GPIO18=RX,见 uart_bridge.c 自补的 S3 分支)
+// 目标串口 3.3V 直连共地;单客户端;连接后首包 2-7 位纯数字会被当作波特率命令
 //
 
 // DO NOT CHANGE

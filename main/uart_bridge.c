@@ -66,6 +66,12 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
     #define UART_BRIDGE_RX UART_NUM_1
     #define UART_BRIDGE_TX_PIN 19
     #define UART_BRIDGE_RX_PIN 18 // PIN18 has 50000ns glitch during the power-up
+#elif defined CONFIG_IDF_TARGET_ESP32S3
+    // S3: GPIO19/20 是 USB D-/D+(COM18 esptool 口),不能碰;SWD 占 11/12,console 占 43/44
+    #define UART_BRIDGE_TX UART_NUM_1
+    #define UART_BRIDGE_RX UART_NUM_1
+    #define UART_BRIDGE_TX_PIN 17
+    #define UART_BRIDGE_RX_PIN 18
 #else
     #error unknown hardware
 #endif
@@ -199,7 +205,7 @@ static void uart_bridge_setup() {
         uart_driver_install(UART_BRIDGE_TX, 0, UART_BUF_SIZE, 0, NULL, 0); // TX only
     }
 
-#if defined CONFIG_IDF_TARGET_ESP32 || defined CONFIG_IDF_TARGET_ESP32C3
+#if defined CONFIG_IDF_TARGET_ESP32 || defined CONFIG_IDF_TARGET_ESP32C3 || defined CONFIG_IDF_TARGET_ESP32S3
     uart_set_pin(UART_BRIDGE_TX, UART_BRIDGE_TX_PIN, UART_BRIDGE_RX_PIN, -1, -1);
 #endif
 
@@ -229,42 +235,41 @@ void uart_bridge_task() {
         int ret = xQueueReceive(uart_server_events, &events, pdMS_TO_TICKS(100));
 
         if (ret != pdTRUE) {
-            // timeout
-            if (is_conn_valid) {
+            // timeout tick: drain UART into the client
+            if (is_conn_valid && uart_netconn != NULL) {
                 ESP_ERROR_CHECK(uart_get_buffered_data_len(UART_BRIDGE_RX, &uart_buf_len));
                 uart_buf_len = uart_buf_len > UART_BUF_SIZE ? UART_BUF_SIZE : uart_buf_len;
                 uart_buf_len = uart_read_bytes(UART_BRIDGE_RX, uart_read_buffer, uart_buf_len, pdMS_TO_TICKS(5));
-                // then send data
-                netconn_write(uart_netconn, uart_read_buffer, uart_buf_len, NETCONN_COPY);
+                if (uart_buf_len > 0 && netconn_write(uart_netconn, uart_read_buffer, uart_buf_len, NETCONN_COPY) != ERR_OK) {
+                    // peer is gone (write retries exhausted): release the slot
+                    ESP_LOGE(UART_TAG, "write fail (tick), closing");
+                    close_tcp_netconn(uart_netconn);
+                    uart_bridge_reset();
+                }
             }
         } else if (events.type == NETCONN_EVT_WIFI_DISCONNECTED) { // WIFI disconnected
-            if (is_conn_valid) {
+            if (is_conn_valid && uart_netconn != NULL) {
                 close_tcp_netconn(uart_netconn);
                 uart_bridge_reset();
             }
-        } else if (events.nc->state == NETCONN_LISTEN) {
+        } else if (events.nc == nc) {
+            // event on the LISTEN conn; pointer-compare dispatch: a stale event
+            // of an already-deleted client conn must never be dereferenced here
             if (is_conn_valid) {
-                netconn_accept(events.nc, &nc_in);
-                if (nc_in)
+                if (netconn_accept(events.nc, &nc_in) == ERR_OK && nc_in != NULL) {
+                    ESP_LOGI(UART_TAG, "busy: kicked newcomer");
                     close_tcp_netconn(nc_in);
+                }
                 continue;
             }
 
-            int err = netconn_accept(events.nc, &nc_in);
-            if (err != ERR_OK) {
-                if (nc_in)
-                    netconn_delete(nc_in);
-                continue;
+            if (netconn_accept(events.nc, &nc_in) == ERR_OK && nc_in != NULL) {
+                ESP_LOGI(UART_TAG, "client accepted");
+                uart_netconn = nc_in;
+                is_conn_valid = true;
+                is_first_time_recv = true;
             }
-
-            ip_addr_t client_addr; // Address port
-            uint16_t client_port;  // Client port
-            netconn_peer(nc_in, &client_addr, &client_port);
-
-            uart_netconn = nc_in;
-            is_conn_valid = true;
-            is_first_time_recv = true;
-        } else if (events.nc->state != NETCONN_LISTEN) {
+        } else if (events.nc == uart_netconn) {
             // if (events.nc && events.nc->pcb.tcp)
             //     tcp_nagle_disable(events.nc->pcb.tcp);
 
@@ -274,24 +279,49 @@ void uart_bridge_task() {
             uart_buf_len = uart_buf_len > UART_BUF_SIZE ? UART_BUF_SIZE : uart_buf_len;
             uart_buf_len = uart_read_bytes(UART_BRIDGE_RX, uart_read_buffer, uart_buf_len, pdMS_TO_TICKS(5));
             // then send data
-            netconn_write(events.nc, uart_read_buffer, uart_buf_len, NETCONN_COPY);
+            if (netconn_write(uart_netconn, uart_read_buffer, uart_buf_len, NETCONN_COPY) != ERR_OK) {
+                // peer is gone (write retries exhausted): release the slot
+                ESP_LOGE(UART_TAG, "write fail, closing");
+                close_tcp_netconn(uart_netconn);
+                uart_bridge_reset();
+                continue;
+            }
 
             // try to get data
-            if ((netconn_recv(events.nc, &netbuf)) == ERR_OK) // data incoming ?
+            err_t rerr = netconn_recv(events.nc, &netbuf);
+            if (rerr == ERR_OK) // data incoming ?
             {
+                uint16_t rx_len = 0;
                 do {
                     netbuf_data(netbuf, (void *)&buffer, &len_buf);
+                    rx_len += len_buf;
                     // write to uart
-                    if (is_first_time_recv) { // change bard rate
+                    if (is_first_time_recv) { // change line config: "<baud>[E|O|N]", e.g. "19200E" = 19200 8E1
                         if (len_buf > 1 && len_buf < 8) {
                             char tmp_buff[8];
                             memcpy(tmp_buff, buffer, len_buf);
                             tmp_buff[len_buf] = '\0';
+                            uart_parity_t parity = UART_PARITY_DISABLE;
+                            int len = len_buf;
+                            char pc = tmp_buff[len - 1];
+                            if (pc == 'E' || pc == 'e') {
+                                parity = UART_PARITY_EVEN;
+                                tmp_buff[--len] = '\0';
+                            } else if (pc == 'O' || pc == 'o') {
+                                parity = UART_PARITY_ODD;
+                                tmp_buff[--len] = '\0';
+                            } else if (pc == 'N' || pc == 'n') {
+                                parity = UART_PARITY_DISABLE;
+                                tmp_buff[--len] = '\0';
+                            }
                             int baudrate = atoi(tmp_buff);
-                            if (baudrate > 0 && baudrate < 2000000 && num_digits(baudrate) == len_buf) {
-                                ESP_LOGI(UART_TAG, "change baud:%d", baudrate);
+                            if (baudrate > 0 && baudrate < 2000000 && num_digits(baudrate) == len) {
+                                ESP_LOGI(UART_TAG, "change line:%d 8%s1", baudrate,
+                                         parity == UART_PARITY_EVEN ? "E" : (parity == UART_PARITY_ODD ? "O" : "N"));
                                 uart_set_baudrate(UART_BRIDGE_RX, baudrate);
                                 uart_set_baudrate(UART_BRIDGE_TX, baudrate);
+                                uart_set_parity(UART_BRIDGE_RX, parity);
+                                uart_set_parity(UART_BRIDGE_TX, parity);
                                 is_first_time_recv = false;
                                 continue;
                             }
@@ -301,13 +331,20 @@ void uart_bridge_task() {
                     uart_write_bytes(UART_BRIDGE_TX, (const char *)buffer, len_buf);
                 } while (netbuf_next(netbuf) >= 0);
                 netbuf_delete(netbuf);
-            } else {
-                if (events.nc->pending_err == ERR_CLSD) {
-                    continue; // The same hacky way to treat a closed connection
+                if (rx_len == 0) {
+                    // empty netbuf = peer closed gracefully (FIN): release the slot
+                    ESP_LOGI(UART_TAG, "FIN rx, closing");
+                    close_tcp_netconn(uart_netconn);
+                    uart_bridge_reset();
                 }
-                close_tcp_netconn(events.nc);
+            } else {
+                // any recv error (incl. ERR_CLSD) means the peer is gone
+                ESP_LOGE(UART_TAG, "recv err=%d, closing", rerr);
+                close_tcp_netconn(uart_netconn);
                 uart_bridge_reset();
             }
+        } else {
+            ESP_LOGI(UART_TAG, "stale event dropped");
         }
     }
 }

@@ -18,6 +18,7 @@
 #include "main/timer.h"
 #include "main/wifi_configuration.h"
 #include "main/wifi_handle.h"
+#include "main/dap_version.h"
 
 #include "components/corsacOTA/src/corsacOTA.h"
 
@@ -28,6 +29,7 @@
 #include "esp_wifi.h"
 #include "esp_event_loop.h"
 #include "esp_log.h"
+#include "esp_mac.h"
 #include "nvs_flash.h"
 
 #include "lwip/err.h"
@@ -96,6 +98,24 @@ void app_main() {
     // }
 
     ESP_ERROR_CHECK(nvs_flash_init());
+
+    // 启动横幅:现场排障时先确认固件身份与 MAC
+    // 注意:此处 WiFi 尚未初始化,不能用 esp_wifi_get_mac(),必须读 eFuse
+    {
+        uint8_t mac[6] = {0};
+        esp_err_t mac_err = esp_efuse_mac_get_default(mac);
+        if (mac_err == ESP_OK) {
+            ESP_LOGI("dap", "=== %s | mac=%02X:%02X:%02X:%02X:%02X:%02X | idf=%s ===",
+                     DAP_FW_ID, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+                     esp_get_idf_version());
+        } else {
+            ESP_LOGI("dap", "=== %s | mac=unavailable(%d) | idf=%s ===",
+                     DAP_FW_ID, (int)mac_err, esp_get_idf_version());
+        }
+        ESP_LOGI("dap", "=== wifi list: %d entries (%s) ===",
+                 (int)WIFI_LIST_SIZE,
+                 WIFI_LIST_IS_FACTORY_DEFAULT ? "factory default" : "local credentials");
+    }
 
 #if (USE_UART_BRIDGE == 1)
     uart_bridge_init();
