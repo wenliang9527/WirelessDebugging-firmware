@@ -76,6 +76,32 @@ static void led_write_level(uint32_t r, uint32_t g, uint32_t b, uint32_t pct)
     s_strip->refresh(s_strip, 100);
 }
 
+/**
+ * 呼吸波形:返回 lo..100 的幅度百分比。
+ *
+ * 关于 lo(最暗幅度)为什么不能给 0:
+ *   - 给 0 时灯每周会完全熄灭一段时间,观感是"闪烁"而不是"呼吸";
+ *   - 人眼对亮度的感知接近对数,看点在于**最亮/最暗的比值**而不是绝对级数。
+ *     4% 整体亮度下满幅是 10/255:lo=0 时范围 0..10(比值无穷但含全黑),
+ *     lo=25 时范围 2..10(比值 5 倍) —— 后者才是连续的呼吸感。
+ *   注意:lo 抬高会**缩小**绝对变化级数(9 级 vs 11 级),这是有意的取舍,
+ *   换来的是"不熄灭"。想让呼吸更明显应该调高整体亮度,而不是压低 lo。
+ *
+ * @param tick          当前拍数
+ * @param period_ticks  一个完整呼吸周期(拍)
+ * @param lo            最暗时的幅度百分比
+ */
+static uint32_t breathe(uint32_t tick, uint32_t period_ticks, uint32_t lo)
+{
+    uint32_t half = period_ticks / 2;
+    if (half == 0) {
+        return 100;
+    }
+    uint32_t phase = tick % period_ticks;
+    uint32_t tri = (phase <= half) ? phase : (period_ticks - phase);  /* 0..half */
+    return lo + (tri * (100u - lo)) / half;
+}
+
 static void led_task(void *arg)
 {
     uint32_t tick = 0;
@@ -83,37 +109,34 @@ static void led_task(void *arg)
         dap_led_state_t st = s_state;
 
         switch (st) {
-        case DAP_LED_BOOT: {
-            /* 白色呼吸:三角波 5%..100%,周期约 2s */
-            uint32_t phase = tick % 33;
-            uint32_t lvl = (phase <= 16) ? (5 + phase * 95 / 16)
-                                         : (5 + (32 - phase) * 95 / 16);
-            led_write_level(255, 255, 255, lvl);
+        case DAP_LED_BOOT:
+            /* 白呼吸:2 秒一个周期,幅度 5%..100% */
+            led_write_level(255, 255, 255, breathe(tick, 34, 5));
             break;
-        }
-        case DAP_LED_CONNECTING: {
-            /* 黄色慢闪:1.2s 周期,亮 40% */
-            uint32_t phase = tick % 20;
-            led_write_level(255, 180, 0, phase < 8 ? 100 : 0);
+
+        case DAP_LED_CONNECTING:
+            /* 黄慢闪:1.2 秒周期,亮 8 拍 / 灭 12 拍 */
+            led_write_level(255, 180, 0, (tick % 20) < 8 ? 100 : 0);
             break;
-        }
+
         case DAP_LED_STA_OK:
-            /* 绿色常亮:只在状态刚变化时写一次,避免无谓刷 RMT */
-            led_write_level(0, 255, 60, 100);
-            vTaskDelay(pdMS_TO_TICKS(300));
-            continue;
-        case DAP_LED_AP_MODE: {
-            /* 蓝色慢闪:1.2s 周期 */
-            uint32_t phase = tick % 20;
-            led_write_level(0, 90, 255, phase < 8 ? 100 : 0);
+            /* 绿呼吸:一切正常时用长周期"心跳",比常亮更有生命力,
+             * 也便于一眼确认灯还活着(常亮看不出程序卡没卡 —— 这是真需求:
+             * 之前灯常亮时,无法区分"稳定运行"和"任务挂了"）。
+             * 3 秒周期、幅度 25%..100%。 */
+            led_write_level(0, 255, 60, breathe(tick, 50, 25));
             break;
-        }
-        case DAP_LED_FAULT: {
-            /* 红色快闪:0.36s 周期,明显区别于"连接中" */
-            uint32_t phase = tick % 6;
-            led_write_level(255, 0, 0, phase < 3 ? 100 : 0);
+
+        case DAP_LED_AP_MODE:
+            /* 蓝慢闪:1.2 秒周期 */
+            led_write_level(0, 90, 255, (tick % 20) < 8 ? 100 : 0);
             break;
-        }
+
+        case DAP_LED_FAULT:
+            /* 红快闪:0.36 秒周期,明显区别于"连接中" */
+            led_write_level(255, 0, 0, (tick % 6) < 3 ? 100 : 0);
+            break;
+
         default:
             led_write(0, 0, 0);
             break;
