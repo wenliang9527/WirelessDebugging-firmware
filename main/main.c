@@ -19,6 +19,7 @@
 #include "main/wifi_configuration.h"
 #include "main/wifi_handle.h"
 #include "main/dap_version.h"
+#include "main/dap_cmd.h"
 
 #include "components/corsacOTA/src/corsacOTA.h"
 
@@ -120,6 +121,12 @@ void app_main() {
 #if (USE_UART_BRIDGE == 1)
     uart_bridge_init();
 #endif
+    // 命令通道要尽早起来:STA 模式下 wifi_init() 会一直阻塞到拿到 IP,
+    // 若在其之后启动,连不上路由器时就永远没法用 @MODE 切换模式。
+    // 这里 NVS 已初始化、WiFi 基座(esp_wifi_init)尚未就绪,
+    // 因此命令表里依赖 WiFi 状态的项目会在执行时自行报错。
+    dap_cmd_init();
+
     wifi_init();
     DAP_Setup();
     timer_init();

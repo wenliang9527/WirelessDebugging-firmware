@@ -22,3 +22,16 @@ CONFIG_LWIP_TCPIP_RECVMBOX_SIZE=64
 CONFIG_ESP32S3_INSTRUCTION_CACHE_32KB=y
 CONFIG_ESP32S3_INSTRUCTION_CACHE_LINE_32B=y
 CONFIG_ESP32S3_INSTRUCTION_CACHE_WRAP=y
+
+# --- Productization P1: console primary channel -> USB-Serial/JTAG -----------
+# IDF's "secondary console" mode is output-only and accepts no input
+# (esp_system/Kconfig: "only supports non-blocking mode without using REPL";
+#  input requires switching the PRIMARY channel to this port). This project
+#  needs COM18 full-duplex for the @command channel:
+#    primary   = USB-Serial/JTAG (GPIO19/20, onboard native USB)
+#    secondary = NONE            (mutually exclusive with the line above)
+# Cost: UART0 (GPIO43/44) no longer carries logs. The UART bridge uses
+#       UART1 (GPIO17/18) and is unaffected.
+CONFIG_ESP_CONSOLE_UART_DEFAULT=n
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+CONFIG_ESP_CONSOLE_SECONDARY_NONE=y

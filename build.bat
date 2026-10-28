@@ -77,8 +77,14 @@ echo [build.bat] CWD      = %CD%
 echo.
 
 if /i "%1"=="fullclean" (
-    echo [build.bat] fullclean: removing sdkconfig and build dir
-    if exist sdkconfig del /q sdkconfig
+    echo [build.bat] fullclean: backing up sdkconfig, removing build dir
+    REM Do NOT delete sdkconfig: it carries CONFIG_IDF_TARGET, and losing it
+    REM silently retargets the build to the default esp32 (wrong toolchain).
+    REM Keep a backup so menuconfig changes can be re-applied if needed.
+    if exist sdkconfig (
+        copy /y sdkconfig sdkconfig.backup >nul
+        echo [build.bat] sdkconfig backed up to sdkconfig.backup
+    )
     if exist build rmdir /s /q build
 ) else if /i "%1"=="clean" (
     echo [build.bat] clean: removing build dir
