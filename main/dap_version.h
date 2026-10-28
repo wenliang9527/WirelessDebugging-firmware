@@ -14,7 +14,7 @@
 #define __DAP_VERSION__
 
 #define DAP_FW_VERSION_MAJOR 0
-#define DAP_FW_VERSION_MINOR 5
+#define DAP_FW_VERSION_MINOR 7
 #define DAP_FW_VERSION_PATCH 0
 
 #define DAP_STR_(x) #x

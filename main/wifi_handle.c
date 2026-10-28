@@ -92,6 +92,11 @@ static volatile bool     s_manual_ok = false;
 static char              s_manual_ssid[DAP_CFG_SSID_LEN];
 static char              s_manual_pass[DAP_CFG_PASS_LEN];
 
+/* 扫描前也要主动 disconnect(否则 IDF 拒绝扫描:"STA is connecting")。
+ * 这次断连同样是自己发起的,回调里必须忽略,否则会白白推进一次
+ * SSID 轮转游标,把扫描前的连接目标打乱。 */
+static volatile bool     s_scanning = false;
+
 bool dap_wifi_busy(void) {
     return s_manual;
 }
@@ -179,6 +184,12 @@ static esp_err_t event_handler(void *ctx, system_event_t *event) {
         uart_bridge_close();
 #endif
 
+        if (s_scanning) {
+            /* 扫描前主动断开的,不代表连接失败 —— 忽略,别推进轮转游标 */
+            ESP_LOGI(TAG, "scan: own disconnect ignored (reason=%d)",
+                     (int)info->disconnected.reason);
+            break;
+        }
         if (s_manual && s_manual_switching) {
             /* 这是 dap_wifi_connect_manual() 主动断开旧连接引发的,
              * 不代表目标 AP 连接失败 —— 直接忽略,等真正的结果。 */
@@ -350,6 +361,23 @@ esp_err_t dap_wifi_scan(dap_scan_result_t *out, int max, int *found) {
         return ESP_ERR_NOT_SUPPORTED;
     }
 
+    /* 关键:IDF 在 STA 处于 connecting 状态时禁止扫描,驱动会直接返回
+     * ESP_FAIL 并在日志里写 "sta_scan: STA is connecting, scan are not allowed!"。
+     *
+     * 这不是边缘情况——自动轮转模式下板子会不停地在列表里换着试,几乎永远
+     * 处在 connecting,导致 @SCAN 几乎必然失败。
+     *
+     * 判据不能用 esp_wifi_sta_get_ap_info:它在"连接中"时会返回上一次关联的
+     * 残留记录(实测 ip 还是 0.0.0.0 时它就返回 OK 并给出 rssi/channel),
+     * 据此判断会漏掉最常见的场景。所以这里无条件先断开,保证驱动回到 idle。
+     * 代价是一次扫描会让当前连接尝试中断,扫完恢复。
+     */
+    s_scanning = true;
+    esp_wifi_disconnect();
+    /* 让驱动把 disconnect 处理完并进入 idle,否则 scan_start 仍会被拒。
+     * 150ms 实测不够,给 300ms。 */
+    vTaskDelay(pdMS_TO_TICKS(300));
+
     /* 前台扫描:block=true 让驱动扫完再返回,内部超时约 3-4s */
     wifi_scan_config_t sc = {
         .ssid = NULL,
@@ -361,12 +389,13 @@ esp_err_t dap_wifi_scan(dap_scan_result_t *out, int max, int *found) {
     esp_err_t err = esp_wifi_scan_start(&sc, true);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "scan_start failed: %s", esp_err_to_name(err));
-        return err;
+        goto restore;
     }
 
     uint16_t ap_num = 0;
     if (esp_wifi_scan_get_ap_num(&ap_num) != ESP_OK || ap_num == 0) {
-        return ESP_OK;  /* 0 个结果不算错误 */
+        err = ESP_OK;  /* 0 个结果不算错误 */
+        goto restore;
     }
     if (ap_num > 32) {
         ap_num = 32;
@@ -374,13 +403,14 @@ esp_err_t dap_wifi_scan(dap_scan_result_t *out, int max, int *found) {
 
     wifi_ap_record_t *recs = calloc(ap_num, sizeof(wifi_ap_record_t));
     if (!recs) {
-        return ESP_ERR_NO_MEM;
+        err = ESP_ERR_NO_MEM;
+        goto restore;
     }
     uint16_t got = ap_num;
     err = esp_wifi_scan_get_ap_records(&got, recs);
     if (err != ESP_OK) {
         free(recs);
-        return err;
+        goto restore;
     }
 
     /* 按 SSID 去重(同名多 BSSID 只留信号最强的),再按 RSSI 降序冒泡排序
@@ -426,7 +456,16 @@ esp_err_t dap_wifi_scan(dap_scan_result_t *out, int max, int *found) {
     }
 
     *found = n;
-    return ESP_OK;
+
+restore:
+    /* 扫完把自动轮转交回系统。
+     * 扫描前无条件断开了,所以这里也要无条件恢复 —— 否则板子会停在
+     * "断开且不再重连"的状态,整机失去 WiFi。 */
+    s_scanning = false;
+    if (s_mode == DAP_MODE_STA && !s_manual) {
+        esp_wifi_connect();
+    }
+    return err;
 }
 
 esp_err_t dap_wifi_connect_manual(const char *ssid, const char *password) {
@@ -458,11 +497,24 @@ esp_err_t dap_wifi_connect_manual(const char *ssid, const char *password) {
 
     /* 先断开当前连接,再用目标 AP 的配置重连。
      * 不要 set_mode/stop,否则会触发 STA_START 走自动轮转。
-     * disconnect 之后驱动需要一点时间落定,紧接着 connect 可能直接失败
-     * (实测返回 ESP_ERR_NO_MEM),这里让出 CPU 200ms。 */
+     * disconnect 之后驱动需要时间落定:紧接着 connect 会返回
+     * ESP_ERR_WIFI_CONN(驱动仍在处理上一条命令)或 ESP_ERR_NO_MEM。
+     * 实测 200ms 不够——扫描恰好刚在末尾调过 esp_wifi_connect() 恢复轮转时
+     * 尤其明显,所以这里改成"短暂等待 + 确认驱动落定"的方式。 */
     s_manual_switching = true;
     esp_wifi_disconnect();
-    vTaskDelay(pdMS_TO_TICKS(200));
+
+    /* 等驱动从 connecting/associated 状态退出来。wifi 状态机在自己跑,
+     * 轮询 sta_get_ap_info 失败 + 再让出几拍,比固定 sleep 可靠。 */
+    for (int i = 0; i < 12; i++) {
+        vTaskDelay(pdMS_TO_TICKS(60));
+        wifi_ap_record_t probe;
+        if (esp_wifi_sta_get_ap_info(&probe) != ESP_OK) {
+            /* 已断开;再多让一拍让驱动内部清理完 */
+            vTaskDelay(pdMS_TO_TICKS(80));
+            break;
+        }
+    }
 
     esp_err_t err = esp_wifi_set_config(ESP_IF_WIFI_STA, &cfg);
     if (err != ESP_OK) {
@@ -472,6 +524,12 @@ esp_err_t dap_wifi_connect_manual(const char *ssid, const char *password) {
         return err;
     }
     err = esp_wifi_connect();
+    if (err == ESP_ERR_WIFI_CONN) {
+        /* 驱动还在忙:再等一拍重试一次,这是实测最容易撞上的一个 */
+        ESP_LOGW(TAG, "manual: connect busy, retrying once");
+        vTaskDelay(pdMS_TO_TICKS(300));
+        err = esp_wifi_connect();
+    }
     s_manual_switching = false;   /* 之后任何断连都是真实结果 */
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "manual: esp_wifi_connect failed %s", esp_err_to_name(err));

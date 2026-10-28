@@ -69,17 +69,29 @@ void dap_cmd_set_wifi_ready(bool ready) {
 /* 输出:统一走 stdout(主 console 已是 USB-Serial/JTAG)                */
 /* ------------------------------------------------------------------ */
 
+/*
+ * 为什么用 fwrite 而不是 usb_serial_jtag_write_bytes():
+ *
+ * IDF 4.4 的 USB-Serial/JTAG 有两条互不相让的 TX 路径,共用同一个硬件 FIFO:
+ *   - VFS(日志,esp_rom_printf / stdout):usb_serial_jtag_tx_char() 直写 FIFO,
+ *     FIFO 满 50ms 后主动丢字节,永不阻塞。
+ *   - 驱动(usb_serial_jtag_write_bytes):写 ring buffer,靠 SERIAL_IN_EMPTY
+ *     中断搬到 FIFO。而该死的中断只在 usb_serial_jtag_ll_txfifo_writable()
+ *     为真时才搬数据。
+ *
+ * 日志一多就把 FIFO 占满,导致 ISR 永远拿不到可写时机,ring buffer 永远排不空。
+ * xRingbufferSend 超时后静默丢数据(返回值都没检查),主机侧则看到 WriteFile
+ * 永久挂起——实测表现就是"烧录后能用几秒,之后 @PING 再也发不进去"。
+ *
+ * 结论:命令输出必须和日志走同一条 VFS 路径,宁可像日志一样被丢弃(有 @ 前缀
+ * 和 PC 侧重试兜底),也不能把整条 TX 拖死。
+ */
 static void cmd_write(const char *buf, size_t len) {
     if (len == 0) {
         return;
     }
-    /* 直接写驱动,避免 stdout 缓冲/换行转换干扰协议帧 */
-#if DAP_CMD_USE_USJ
-    usb_serial_jtag_write_bytes(buf, len, pdMS_TO_TICKS(100));
-#else
     fwrite(buf, 1, len, stdout);
     fflush(stdout);
-#endif
 }
 
 void dap_cmd_reply(const char *fmt, ...) {
