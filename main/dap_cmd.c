@@ -27,8 +27,10 @@
 #include <sys/param.h>
 
 #include "main/dap_cmd.h"
+#include "main/dap_config.h"
 #include "main/dap_version.h"
 #include "main/wifi_configuration.h"
+#include "main/wifi_handle.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -234,6 +236,157 @@ static void cmd_reboot(const char *args) {
     esp_restart();
 }
 
+/* ------------------------------------------------------------------ */
+/* P2:扫描 / 连接 / 凭据管理                                           */
+/* ------------------------------------------------------------------ */
+
+/** authmode 转可读文本,PC 侧直接显示 */
+static const char *auth_str(uint8_t m) {
+    switch (m) {
+    case WIFI_AUTH_OPEN:            return "OPEN";
+    case WIFI_AUTH_WEP:             return "WEP";
+    case WIFI_AUTH_WPA_PSK:         return "WPA";
+    case WIFI_AUTH_WPA2_PSK:        return "WPA2";
+    case WIFI_AUTH_WPA_WPA2_PSK:    return "WPA/WPA2";
+    case WIFI_AUTH_WPA2_ENTERPRISE: return "WPA2-ENT";
+    case WIFI_AUTH_WPA3_PSK:        return "WPA3";
+    case WIFI_AUTH_WPA2_WPA3_PSK:   return "WPA2/WPA3";
+    default:                        return "UNKNOWN";
+    }
+}
+
+static void cmd_scan(const char *args) {
+    dap_scan_result_t *res = calloc(24, sizeof(dap_scan_result_t));
+    if (!res) {
+        dap_cmd_err(DAP_ERR_INTERNAL, "no_mem");
+        return;
+    }
+    int found = 0;
+    esp_err_t err = dap_wifi_scan(res, 24, &found);
+    if (err == ESP_ERR_NOT_SUPPORTED) {
+        /* 纯 AP 模式下 IDF 驱动不支持扫描,这是硬约束 */
+        dap_cmd_err(DAP_ERR_MODE_AP, "scan_requires_STA_mode");
+        free(res);
+        return;
+    }
+    if (err != ESP_OK) {
+        dap_cmd_err(DAP_ERR_INTERNAL, esp_err_to_name(err));
+        free(res);
+        return;
+    }
+    for (int i = 0; i < found; i++) {
+        dap_cmd_data("idx=%d&ssid=%s&rssi=%d&auth=%s&ch=%d",
+                     i, res[i].ssid, (int)res[i].rssi,
+                     auth_str(res[i].authmode), (int)res[i].channel);
+    }
+    dap_cmd_ok("scan count=%d", found);
+    free(res);
+}
+
+static void cmd_connect(const char *args) {
+    char ssid[DAP_CFG_SSID_LEN] = {0};
+    char pass[DAP_CFG_PASS_LEN] = {0};
+
+    if (!args || !param_get(args, "ssid", ssid, sizeof(ssid)) || ssid[0] == '\0') {
+        dap_cmd_err(DAP_ERR_BADARG, "missing_ssid");
+        return;
+    }
+    if (!param_get(args, "pass", pass, sizeof(pass))) {
+        pass[0] = '\0';  /* 允许开放网络 */
+    }
+
+    if (dap_wifi_busy()) {
+        dap_cmd_err(DAP_ERR_BUSY, "connect_in_progress");
+        return;
+    }
+
+    esp_err_t err = dap_wifi_connect_manual(ssid, pass);
+    if (err == ESP_ERR_INVALID_STATE) {
+        dap_cmd_err(DAP_ERR_MODE_AP, "connect_requires_STA_mode");
+        return;
+    }
+    if (err != ESP_OK) {
+        /* 这里是"启动连接"就失败(而非连接过程失败),用 500 段错误码,
+         * 避免把 ESP_ERR_xxx 的原始数字(如 8)当成 WiFi 原因码误导 PC。 */
+        dap_cmd_err(DAP_ERR_INTERNAL, esp_err_to_name(err));
+        return;
+    }
+
+    /* 轮询等待结果。命令处理是串行的,这里阻塞不影响其他命令(它们会排队),
+     * 但会挡住 @PING —— 所以超时给足却不过长。 */
+    TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(25000);
+    while (xTaskGetTickCount() < deadline) {
+        bool done = false, ok = false;
+        int reason = 0;
+        dap_wifi_get_manual_result(&done, &ok, &reason);
+        if (done) {
+            if (ok) {
+                tcpip_adapter_ip_info_t ip;
+                char ipstr[16] = "0.0.0.0";
+                if (tcpip_adapter_get_ip_info(TCPIP_ADAPTER_IF_STA, &ip) == ESP_OK) {
+                    snprintf(ipstr, sizeof(ipstr), IPSTR, IP2STR(&ip.ip));
+                }
+                dap_cmd_ok("connected ssid=%s ip=%s", ssid, ipstr);
+            } else {
+                /* 原因码直接透传 IDF 值,PC 侧据此给不同提示 */
+                const char *msg = "connect_failed";
+                switch (reason) {
+                case WIFI_REASON_NO_AP_FOUND:           msg = "NO_AP_FOUND"; break;
+                case WIFI_REASON_AUTH_FAIL:             msg = "AUTH_FAIL"; break;
+                case WIFI_REASON_AUTH_EXPIRE:           msg = "AUTH_EXPIRE"; break;
+                case WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT: msg = "HANDSHAKE_TIMEOUT"; break;
+                case WIFI_REASON_HANDSHAKE_TIMEOUT:     msg = "HANDSHAKE_TIMEOUT"; break;
+                case WIFI_REASON_CONNECTION_FAIL:       msg = "CONNECTION_FAIL"; break;
+                default: break;
+                }
+                dap_cmd_err(reason > 0 ? reason : DAP_ERR_TIMEOUT, msg);
+            }
+            return;
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    dap_cmd_err(DAP_ERR_TIMEOUT, "TIMEOUT");
+}
+
+static void cmd_list(const char *args) {
+    int n = dap_config_count();
+    for (int i = 0; i < n; i++) {
+        dap_cfg_ap_t ap;
+        if (!dap_config_get(i, &ap)) {
+            continue;
+        }
+        /* 密码打码:只报是否存在,不泄露到日志/终端 */
+        dap_cmd_data("idx=%d&ssid=%s&pass=%s",
+                     i, ap.ssid, ap.password[0] ? "***" : "(open)");
+    }
+    dap_cmd_ok("count=%d source=%s", n,
+               dap_config_using_factory() ? "factory" : "nvs");
+}
+
+static void cmd_del(const char *args) {
+    char v[12] = {0};
+    if (!args || !param_get(args, "idx", v, sizeof(v))) {
+        dap_cmd_err(DAP_ERR_BADARG, "missing_idx");
+        return;
+    }
+    int idx = atoi(v);
+    esp_err_t err = dap_config_del(idx);
+    if (err != ESP_OK) {
+        dap_cmd_err(DAP_ERR_BADARG, "idx_out_of_range");
+        return;
+    }
+    dap_cmd_ok("deleted idx=%d remaining=%d", idx, dap_config_count());
+}
+
+static void cmd_factory(const char *args) {
+    dap_cmd_ok("rebooting");
+    vTaskDelay(pdMS_TO_TICKS(100));
+    if (dap_config_factory_reset() != ESP_OK) {
+        ESP_LOGW(TAG, "factory reset nvs error");
+    }
+    esp_restart();
+}
+
 static void cmd_mode(const char *args) {
     char want[8] = {0};
     if (!args || sscanf(args, "%7s", want) != 1) {
@@ -283,10 +436,15 @@ typedef struct {
 } cmd_entry_t;
 
 static const cmd_entry_t s_cmds[] = {
-    { "PING",    cmd_ping   },
-    { "STATUS",  cmd_status },
-    { "MODE",    cmd_mode   },
-    { "REBOOT",  cmd_reboot },
+    { "PING",    cmd_ping    },
+    { "STATUS",  cmd_status  },
+    { "SCAN",    cmd_scan    },
+    { "CONNECT", cmd_connect },
+    { "LIST",    cmd_list    },
+    { "DEL",     cmd_del     },
+    { "MODE",    cmd_mode    },
+    { "FACTORY", cmd_factory },
+    { "REBOOT",  cmd_reboot  },
 };
 
 static void dispatch_line(char *line) {

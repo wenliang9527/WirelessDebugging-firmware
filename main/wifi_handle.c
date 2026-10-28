@@ -13,11 +13,13 @@
 #include <string.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <sys/param.h>
 
 #include "main/wifi_configuration.h"
 #include "main/wifi_handle.h"
 #include "main/dap_cmd.h"
+#include "main/dap_config.h"
 #include "main/dap_version.h"
 #include "main/uart_bridge.h"
 
@@ -51,10 +53,6 @@
 
 static const char *TAG = "wifi";
 
-/* NVS:模式偏好 */
-#define NVS_NS_CFG        "dap_cfg"
-#define NVS_KEY_MODE      "mode"
-
 /* AP 参数(E3 默认值) */
 #define AP_SSID_PREFIX    "DAP-"
 #define AP_PASSWORD       "12345678"
@@ -64,6 +62,9 @@ static const char *TAG = "wifi";
 /* 启动时最长等 IP 的时间。超时不算失败,只是让命令通道先能用;
  * 之后 STA 仍会在后台按列表轮转重连。 */
 #define STA_BOOT_WAIT_MS  20000
+
+/* 单次手动连接(@CONNECT)的等待上限 */
+#define MANUAL_CONNECT_TIMEOUT_MS 20000
 
 static EventGroupHandle_t wifi_event_group;
 static int ssid_index = 0;
@@ -76,30 +77,29 @@ const int IPV4_GOTIP_BIT = BIT0;
 static void ssid_change(void);
 
 /* ------------------------------------------------------------------ */
-/* NVS:模式偏好                                                        */
+/* 手动连接(@CONNECT)状态                                             */
 /* ------------------------------------------------------------------ */
 
-static void mode_load(void) {
-    nvs_handle_t h;
-    if (nvs_open(NVS_NS_CFG, NVS_READONLY, &h) != ESP_OK) {
-        return;
-    }
-    uint8_t v = 0;
-    if (nvs_get_u8(h, NVS_KEY_MODE, &v) == ESP_OK && v == DAP_MODE_AP) {
-        s_mode = DAP_MODE_AP;
-    }
-    nvs_close(h);
+static volatile bool     s_manual = false;     /* 正在执行手动连接 */
+/* 手动连接时我们会主动 disconnect 一次。该动作同样会触发
+ * STA_DISCONNECTED 回调,若不区分就会被误判成"连接失败"并清掉 s_manual,
+ * 导致随后的 esp_wifi_connect() 返回 ESP_ERR_WIFI_CONN。
+ * 这个标志标记"这次断连是自己发起的",回调里直接忽略。 */
+static volatile bool     s_manual_switching = false;
+static volatile int      s_manual_reason = 0;  /* 最近一次断连原因码 */
+static volatile bool     s_manual_done = false;
+static volatile bool     s_manual_ok = false;
+static char              s_manual_ssid[DAP_CFG_SSID_LEN];
+static char              s_manual_pass[DAP_CFG_PASS_LEN];
+
+bool dap_wifi_busy(void) {
+    return s_manual;
 }
 
-static void mode_save(dap_mode_t m) {
-    nvs_handle_t h;
-    if (nvs_open(NVS_NS_CFG, NVS_READWRITE, &h) != ESP_OK) {
-        ESP_LOGW(TAG, "nvs open failed, mode not persisted");
-        return;
-    }
-    nvs_set_u8(h, NVS_KEY_MODE, (uint8_t)m);
-    nvs_commit(h);
-    nvs_close(h);
+void dap_wifi_get_manual_result(bool *done, bool *ok, int *reason) {
+    if (done)   *done = s_manual_done;
+    if (ok)     *ok = s_manual_ok;
+    if (reason) *reason = s_manual_reason;
 }
 
 /* ------------------------------------------------------------------ */
@@ -142,12 +142,25 @@ static esp_err_t event_handler(void *ctx, system_event_t *event) {
         break;
 
     case SYSTEM_EVENT_STA_CONNECTED:
+        if (s_manual) {
+            ESP_LOGI(TAG, "manual connect: associated with %s", s_manual_ssid);
+        }
         break;
 
     case SYSTEM_EVENT_STA_GOT_IP:
         GPIO_SET_LEVEL_HIGH(PIN_LED_WIFI_STATUS);
         xEventGroupSetBits(wifi_event_group, IPV4_GOTIP_BIT);
         ESP_LOGI(TAG, "STA got ip: %s", ip4addr_ntoa(&event->event_info.got_ip.ip_info.ip));
+        if (s_manual) {
+            /* 手动连接成功:落盘并结束 */
+            s_manual_ok = true;
+            s_manual_done = true;
+            s_manual = false;
+            if (dap_config_add(s_manual_ssid, s_manual_pass) != ESP_OK) {
+                ESP_LOGW(TAG, "failed to persist %s", s_manual_ssid);
+            }
+            ssid_index = 0;
+        }
         break;
 
     case SYSTEM_EVENT_STA_DISCONNECTED:
@@ -165,6 +178,30 @@ static esp_err_t event_handler(void *ctx, system_event_t *event) {
 #if (USE_UART_BRIDGE == 1)
         uart_bridge_close();
 #endif
+
+        if (s_manual && s_manual_switching) {
+            /* 这是 dap_wifi_connect_manual() 主动断开旧连接引发的,
+             * 不代表目标 AP 连接失败 —— 直接忽略,等真正的结果。 */
+            ESP_LOGI(TAG, "manual: own disconnect ignored (reason=%d)",
+                     (int)info->disconnected.reason);
+            break;
+        }
+        if (s_manual) {
+            /* 手动连接期间不轮转:如实记录原因码交给 @CONNECT 上报。 */
+            s_manual_reason = (int)info->disconnected.reason;
+            s_manual_ok = false;
+            s_manual_done = true;
+            s_manual = false;
+            ESP_LOGW(TAG, "manual connect to %s failed, reason=%d",
+                     s_manual_ssid, s_manual_reason);
+            /* 恢复自动轮转 */
+            ssid_index = 0;
+            if (s_mode == DAP_MODE_STA) {
+                ssid_change();
+                esp_wifi_connect();
+            }
+            break;
+        }
 
         /* 产品化约束 C2:不自动降级到 AP。仅 STA 模式下继续轮转重连。 */
         if (s_mode == DAP_MODE_STA) {
@@ -196,16 +233,28 @@ static esp_err_t event_handler(void *ctx, system_event_t *event) {
 /* ------------------------------------------------------------------ */
 
 static void ssid_change(void) {
-    if (ssid_index > (int)WIFI_LIST_SIZE - 1) {
+    int n = dap_config_count();
+    if (n <= 0) {
+        /* 理论上不会发生(出厂列表至少有一条),兜底避免除零/空转 */
+        ESP_LOGW(TAG, "no configured network");
+        return;
+    }
+    if (ssid_index < 0 || ssid_index >= n) {
         ssid_index = 0;
     }
 
+    dap_cfg_ap_t ap;
+    if (!dap_config_get(ssid_index, &ap)) {
+        ssid_index = 0;
+        return;
+    }
+
     wifi_config_t wifi_config = {0};
-    strncpy((char *)wifi_config.sta.ssid, wifi_list[ssid_index].ssid,
-            sizeof(wifi_config.sta.ssid) - 1);
-    strncpy((char *)wifi_config.sta.password, wifi_list[ssid_index].password,
-            sizeof(wifi_config.sta.password) - 1);
-    ESP_LOGI(TAG, "trying ssid[%d]: %s", ssid_index, wifi_config.sta.ssid);
+    /* 用 "%.31s"/"%.63s" 显式限定长度:目标缓冲区(32/64)可能小于源
+     * 数组容量(33/65),不加精度限定会触发 -Werror=format-truncation。 */
+    snprintf((char *)wifi_config.sta.ssid, sizeof(wifi_config.sta.ssid), "%.31s", ap.ssid);
+    snprintf((char *)wifi_config.sta.password, sizeof(wifi_config.sta.password), "%.63s", ap.password);
+    ESP_LOGI(TAG, "trying ssid[%d/%d]: %s", ssid_index, n, wifi_config.sta.ssid);
     ssid_index++;
     ESP_ERROR_CHECK(esp_wifi_set_config(ESP_IF_WIFI_STA, &wifi_config));
 }
@@ -277,7 +326,158 @@ esp_err_t dap_cmd_set_mode(dap_mode_t mode) {
         return err;
     }
 
-    mode_save(mode);
+    dap_config_set_mode_pref((mode == DAP_MODE_AP) ? 1 : 0);
+    return ESP_OK;
+}
+
+/* ------------------------------------------------------------------ */
+/* 扫描与手动连接(P2)                                                 */
+/* ------------------------------------------------------------------ */
+
+esp_err_t dap_wifi_scan(dap_scan_result_t *out, int max, int *found) {
+    if (!out || !found || max <= 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *found = 0;
+
+    wifi_mode_t mode;
+    if (esp_wifi_get_mode(&mode) != ESP_OK) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    /* 纯 AP 模式下 WiFi 驱动不支持扫描(IDF: 仅 Station 或 Station+AP)。
+     * 这是硬约束,不是本项目的选择。 */
+    if (mode != WIFI_MODE_STA && mode != WIFI_MODE_APSTA) {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+
+    /* 前台扫描:block=true 让驱动扫完再返回,内部超时约 3-4s */
+    wifi_scan_config_t sc = {
+        .ssid = NULL,
+        .bssid = NULL,
+        .channel = 0,
+        .show_hidden = false,
+        .scan_type = WIFI_SCAN_TYPE_ACTIVE,
+    };
+    esp_err_t err = esp_wifi_scan_start(&sc, true);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "scan_start failed: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    uint16_t ap_num = 0;
+    if (esp_wifi_scan_get_ap_num(&ap_num) != ESP_OK || ap_num == 0) {
+        return ESP_OK;  /* 0 个结果不算错误 */
+    }
+    if (ap_num > 32) {
+        ap_num = 32;
+    }
+
+    wifi_ap_record_t *recs = calloc(ap_num, sizeof(wifi_ap_record_t));
+    if (!recs) {
+        return ESP_ERR_NO_MEM;
+    }
+    uint16_t got = ap_num;
+    err = esp_wifi_scan_get_ap_records(&got, recs);
+    if (err != ESP_OK) {
+        free(recs);
+        return err;
+    }
+
+    /* 按 SSID 去重(同名多 BSSID 只留信号最强的),再按 RSSI 降序冒泡排序
+     * —— 结果集很小(通常 <20),不必上 qsort 也足够快。 */
+    int n = 0;
+    for (uint16_t i = 0; i < got && n < max; i++) {
+        if (recs[i].ssid[0] == '\0') {
+            continue;  /* 隐藏 SSID 对配网无意义 */
+        }
+        int dup = -1;
+        for (int k = 0; k < n; k++) {
+            if (strncmp((char *)out[k].ssid, (char *)recs[i].ssid,
+                        sizeof(out[k].ssid)) == 0) {
+                dup = k;
+                break;
+            }
+        }
+        if (dup >= 0) {
+            if (recs[i].rssi > out[dup].rssi) {
+                out[dup].rssi = recs[i].rssi;
+                out[dup].authmode = (uint8_t)recs[i].authmode;
+                out[dup].channel = recs[i].primary;
+            }
+            continue;
+        }
+        memcpy(out[n].ssid, recs[i].ssid, sizeof(out[n].ssid));
+        out[n].ssid[sizeof(out[n].ssid) - 1] = '\0';
+        out[n].rssi = recs[i].rssi;
+        out[n].authmode = (uint8_t)recs[i].authmode;
+        out[n].channel = recs[i].primary;
+        n++;
+    }
+    free(recs);
+
+    for (int i = 1; i < n; i++) {
+        dap_scan_result_t key = out[i];
+        int j = i - 1;
+        while (j >= 0 && out[j].rssi < key.rssi) {
+            out[j + 1] = out[j];
+            j--;
+        }
+        out[j + 1] = key;
+    }
+
+    *found = n;
+    return ESP_OK;
+}
+
+esp_err_t dap_wifi_connect_manual(const char *ssid, const char *password) {
+    if (!ssid || ssid[0] == '\0') {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (s_manual) {
+        return ESP_ERR_INVALID_STATE;  /* 已有一次在跑 */
+    }
+    if (s_mode != DAP_MODE_STA) {
+        return ESP_ERR_INVALID_STATE;  /* AP 模式下不能连 */
+    }
+
+    strncpy(s_manual_ssid, ssid, sizeof(s_manual_ssid) - 1);
+    s_manual_ssid[sizeof(s_manual_ssid) - 1] = '\0';
+    strncpy(s_manual_pass, password ? password : "", sizeof(s_manual_pass) - 1);
+    s_manual_pass[sizeof(s_manual_pass) - 1] = '\0';
+
+    s_manual_done = false;
+    s_manual_ok = false;
+    s_manual_reason = 0;
+    s_manual = true;
+
+    wifi_config_t cfg = {0};
+    snprintf((char *)cfg.sta.ssid, sizeof(cfg.sta.ssid), "%.31s", s_manual_ssid);
+    snprintf((char *)cfg.sta.password, sizeof(cfg.sta.password), "%.63s", s_manual_pass);
+
+    ESP_LOGI(TAG, "manual connect -> %s", s_manual_ssid);
+
+    /* 先断开当前连接,再用目标 AP 的配置重连。
+     * 不要 set_mode/stop,否则会触发 STA_START 走自动轮转。
+     * disconnect 之后驱动需要一点时间落定,紧接着 connect 可能直接失败
+     * (实测返回 ESP_ERR_NO_MEM),这里让出 CPU 200ms。 */
+    s_manual_switching = true;
+    esp_wifi_disconnect();
+    vTaskDelay(pdMS_TO_TICKS(200));
+
+    esp_err_t err = esp_wifi_set_config(ESP_IF_WIFI_STA, &cfg);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "manual: set_config failed %s", esp_err_to_name(err));
+        s_manual = false;
+        s_manual_switching = false;
+        return err;
+    }
+    err = esp_wifi_connect();
+    s_manual_switching = false;   /* 之后任何断连都是真实结果 */
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "manual: esp_wifi_connect failed %s", esp_err_to_name(err));
+        s_manual = false;
+        return err;
+    }
     return ESP_OK;
 }
 
@@ -299,7 +499,9 @@ static void wifi_hw_init_stage1(void) {
     ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
 
     ap_ssid_build();
-    mode_load();
+    if (dap_config_get_mode_pref() == 1) {
+        s_mode = DAP_MODE_AP;
+    }
 }
 
 /* 上游 API 保留:完成 WiFi 硬件初始化 + 按模式启动并等待(仅 STA 会阻塞到拿到 IP) */

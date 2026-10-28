@@ -20,6 +20,7 @@
 #include "main/wifi_handle.h"
 #include "main/dap_version.h"
 #include "main/dap_cmd.h"
+#include "main/dap_config.h"
 
 #include "components/corsacOTA/src/corsacOTA.h"
 
@@ -117,6 +118,9 @@ void app_main() {
                  (int)WIFI_LIST_SIZE,
                  WIFI_LIST_IS_FACTORY_DEFAULT ? "factory default" : "local credentials");
     }
+
+    // 配置层必须先起来:@STATUS/@SCAN/@LIST 等命令都依赖它读列表与模式偏好
+    dap_config_init();
 
 #if (USE_UART_BRIDGE == 1)
     uart_bridge_init();
