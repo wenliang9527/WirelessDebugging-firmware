@@ -271,9 +271,15 @@ static void ssid_change(void) {
     if (ssid_index < 0 || ssid_index >= n) {
         ssid_index = 0;
     }
+    /* ssid_index 是"逻辑序号"(连接顺序),不是物理下标:
+     * pin 过的网络永远排在前面,映射由 dap_config_conn_physical() 完成。 */
+    int phys = dap_config_conn_physical(ssid_index);
+    if (phys < 0) {
+        phys = 0;
+    }
 
     dap_cfg_ap_t ap;
-    if (!dap_config_get(ssid_index, &ap)) {
+    if (!dap_config_get(phys, &ap)) {
         ssid_index = 0;
         return;
     }
@@ -283,7 +289,8 @@ static void ssid_change(void) {
      * 数组容量(33/65),不加精度限定会触发 -Werror=format-truncation。 */
     snprintf((char *)wifi_config.sta.ssid, sizeof(wifi_config.sta.ssid), "%.31s", ap.ssid);
     snprintf((char *)wifi_config.sta.password, sizeof(wifi_config.sta.password), "%.63s", ap.password);
-    ESP_LOGI(TAG, "trying ssid[%d/%d]: %s", ssid_index, n, wifi_config.sta.ssid);
+    ESP_LOGI(TAG, "trying ssid[%d/%d]: %s%s", ssid_index, n, wifi_config.sta.ssid,
+             ap.pin ? " (pinned)" : "");
     ssid_index++;
 
     /* 绝对不能用 ESP_ERROR_CHECK:它在失败时直接 abort,整块板子 panic 重启。

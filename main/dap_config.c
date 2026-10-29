@@ -62,6 +62,10 @@ static void key_pass(int idx, char *buf, size_t len) {
     snprintf(buf, len, "ap%d_pass", idx);
 }
 
+static void key_pin(int idx, char *buf, size_t len) {
+    snprintf(buf, len, "ap%d_pin", idx);
+}
+
 /** 把编译期列表复制进内存镜像(出厂默认) */
 static void load_factory_list(void) {
     s_count = 0;
@@ -72,6 +76,7 @@ static void load_factory_list(void) {
     for (int i = 0; i < n; i++) {
         copy_ssid(s_aps[i].ssid, wifi_list[i].ssid);
         copy_pass(s_aps[i].password, wifi_list[i].password);
+        s_aps[i].pin = 0;
     }
     s_count = n;
     s_factory = true;
@@ -103,9 +108,10 @@ static bool load_from_nvs(void) {
 
     int loaded = 0;
     for (int i = 0; i < cnt; i++) {
-        char ks[KEY_BUF_LEN], kp[KEY_BUF_LEN];
+        char ks[KEY_BUF_LEN], kp[KEY_BUF_LEN], kt[KEY_BUF_LEN];
         key_ssid(i, ks, sizeof(ks));
         key_pass(i, kp, sizeof(kp));
+        key_pin(i, kt, sizeof(kt));
 
         size_t sl = DAP_CFG_SSID_LEN;
         size_t pl = DAP_CFG_PASS_LEN;
@@ -118,8 +124,11 @@ static bool load_from_nvs(void) {
         if (nvs_get_str(h, kp, pass, &pl) != ESP_OK) {
             pass[0] = '\0';  /* 开放网络 */
         }
+        uint8_t pin = 0;
+        nvs_get_u8(h, kt, &pin);   /* 缺键 = 未 pin,不必报错 */
         copy_ssid(s_aps[loaded].ssid, ssid);
         copy_pass(s_aps[loaded].password, pass);
+        s_aps[loaded].pin = pin ? 1 : 0;
         loaded++;
     }
 
@@ -148,23 +157,30 @@ static esp_err_t save_all(void) {
 
     /* 先清掉可能残留的旧键(条数变少时),避免读到僵尸条目 */
     for (int i = 0; i < DAP_CFG_MAX_AP; i++) {
-        char ks[KEY_BUF_LEN], kp[KEY_BUF_LEN];
+        char ks[KEY_BUF_LEN], kp[KEY_BUF_LEN], kt[KEY_BUF_LEN];
         key_ssid(i, ks, sizeof(ks));
         key_pass(i, kp, sizeof(kp));
+        key_pin(i, kt, sizeof(kt));
         nvs_erase_key(h, ks);
         nvs_erase_key(h, kp);
+        nvs_erase_key(h, kt);
     }
     nvs_erase_key(h, KEY_COUNT);
 
     for (int i = 0; i < s_count; i++) {
-        char ks[KEY_BUF_LEN], kp[KEY_BUF_LEN];
+        char ks[KEY_BUF_LEN], kp[KEY_BUF_LEN], kt[KEY_BUF_LEN];
         key_ssid(i, ks, sizeof(ks));
         key_pass(i, kp, sizeof(kp));
+        key_pin(i, kt, sizeof(kt));
         err = nvs_set_str(h, ks, s_aps[i].ssid);
         if (err != ESP_OK) {
             goto done;
         }
         err = nvs_set_str(h, kp, s_aps[i].password);
+        if (err != ESP_OK) {
+            goto done;
+        }
+        err = nvs_set_u8(h, kt, s_aps[i].pin ? 1 : 0);
         if (err != ESP_OK) {
             goto done;
         }
@@ -256,6 +272,9 @@ esp_err_t dap_config_add(const char *ssid, const char *password) {
         }
         copy_ssid(s_aps[0].ssid, ssid);
         copy_pass(s_aps[0].password, password);
+        /* 整体后移让 s_aps[0] 仍带着旧首条的 pin,新条目必须显式清零,
+         * 否则"新连的网络"会继承别人的固定优先。 */
+        s_aps[0].pin = 0;
     }
 
     return save_all();
@@ -289,6 +308,54 @@ esp_err_t dap_config_prioritize(int idx) {
     }
     s_aps[0] = tmp;
     return save_all();
+}
+
+esp_err_t dap_config_set_pin(int idx, bool pin) {
+    if (idx < 0 || idx >= s_count) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    uint8_t v = pin ? 1 : 0;
+    if (s_aps[idx].pin == v) {
+        return ESP_OK;  /* 幂等:状态没变就不写 NVS */
+    }
+    s_aps[idx].pin = v;
+    return save_all();
+}
+
+bool dap_config_pin_at(int idx) {
+    if (idx < 0 || idx >= s_count) {
+        return false;
+    }
+    return s_aps[idx].pin != 0;
+}
+
+int dap_config_conn_physical(int logical) {
+    if (logical < 0 || logical >= s_count) {
+        return -1;
+    }
+    /* 计算序 = pin 过的在前(组内保持物理序),未 pin 的跟随其后(即 LRU:
+     * @CONNECT 自动置顶让"最近连过的"排物理最前,这里自然继承)。
+     * 轮转游标 ssid_index 从此是"逻辑序号",看不懂这层映射的调用方
+     * (dap_config_get 直取)不受影响。 */
+    int pinned_seen = 0;
+    for (int i = 0; i < s_count; i++) {
+        if (s_aps[i].pin) {
+            if (logical == pinned_seen) {
+                return i;
+            }
+            pinned_seen++;
+        }
+    }
+    int unpinned_seen = 0;
+    for (int i = 0; i < s_count; i++) {
+        if (!s_aps[i].pin) {
+            if (logical - pinned_seen == unpinned_seen) {
+                return i;
+            }
+            unpinned_seen++;
+        }
+    }
+    return -1;  /* 不可达:logical 已在入口挡住越界 */
 }
 
 int dap_config_index_of(const char *ssid) {

@@ -27,6 +27,7 @@ extern "C" {
 typedef struct {
     char ssid[DAP_CFG_SSID_LEN];
     char password[DAP_CFG_PASS_LEN];
+    uint8_t pin;    /* 1 = 固定优先:连接轮转永远排在未 pin 条目之前 */
 } dap_cfg_ap_t;
 
 /** 初始化(读 NVS,失败时标记为出厂默认状态) */
@@ -54,10 +55,33 @@ esp_err_t dap_config_del(int idx);
 esp_err_t dap_config_prioritize(int idx);
 
 /**
+ * pin 标记:给第 idx 条打上/摘掉"固定优先"。
+ *
+ * 与 @PRIO(物理置顶)的区别:@CONNECT 成功会自动把目标网络移到物理最前,
+ * 一次性置顶会被下次手动连接顶掉;pin 是粘性标志,连接轮转时 pinned 条目
+ * 永远排在未 pinned 条目之前,与物理顺序无关。物理顺序仍然表达"最近用过的
+ * 未 pin 网络优先"。
+ */
+esp_err_t dap_config_set_pin(int idx, bool pin);
+
+/** 第 idx 条是否被 pin(越界返回 false) */
+bool dap_config_pin_at(int idx);
+
+/**
  * 排名查询:返回 ssid 在列表中的位置,未找到返回 -1。
  * 供 @STATUS/@LIST 之外的诊断使用。
  */
 int dap_config_index_of(const char *ssid);
+
+/**
+ * 连接顺序映射:第 logical 个尝试的网络在物理列表里的下标。
+ *
+ * 连接顺序 = pin 过的在前 + 未 pin 的在后(组内保持物理序)。
+ * STA 轮转(wifi_handle.c 的 ssid_index)用这个游标遍历;@CONNECT 成功的
+ * 自动置顶只动物理顺序,推不倒 pin —— 这正是 pin 与 @PRIO 的语义分界。
+ * 越界返回 -1。
+ */
+int dap_config_conn_physical(int logical);
 
 /** 是否正在使用编译期出厂列表(即 NVS 里没有任何用户配置) */
 bool dap_config_using_factory(void);

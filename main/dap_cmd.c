@@ -12,6 +12,10 @@
  *   板 -> PC:  "@OK ..." / "@ERR <码> <说明>" / "@DATA ..." / "@EVT ..."
  *   板端 IDF 日志不带 '@' 前缀,PC 侧一律当噪声丢弃。
  *
+ * 命令一览(2026-10):
+ *   @PING @STATUS @SCAN @CONNECT @LIST @DEL @PRIO @PIN @MODE @LED
+ *   @FACTORY @REBOOT
+ *
  * 并发:
  *   单任务串行处理。命令处理函数尽量短;耗时操作(如 @CONNECT 扫描)由
  *   wifi 侧配合,这里只负责解析与回帧。
@@ -368,9 +372,9 @@ static void cmd_list(const char *args) {
         if (!dap_config_get(i, &ap)) {
             continue;
         }
-        /* 密码打码:只报是否存在,不泄露到日志/终端 */
-        dap_cmd_data("idx=%d&ssid=%s&pass=%s",
-                     i, ap.ssid, ap.password[0] ? "***" : "(open)");
+        /* 密码打码:只报是否存在,不泄露到日志/终端。pin= 固定优先标志。 */
+        dap_cmd_data("idx=%d&ssid=%s&pass=%s&pin=%d",
+                     i, ap.ssid, ap.password[0] ? "***" : "(open)", ap.pin ? 1 : 0);
     }
     dap_cmd_ok("count=%d source=%s", n,
                dap_config_using_factory() ? "factory" : "nvs");
@@ -440,6 +444,47 @@ static void cmd_prio(const char *args) {
     } else {
         dap_cmd_ok("prioritized idx=0");
     }
+}
+
+/**
+ * @PIN idx=N on|off   给第 N 条打/摘"固定优先"标记(粘性,存 NVS)
+ *
+ * 与 @PRIO 的语义分界:@PRIO 是一次性物理置顶,会被下次 @CONNECT 的自动
+ * 置顶顶掉;@PIN 是粘性标志,连接轮转时 pinned 条目永远排在未 pinned
+ * 之前,与物理顺序无关。GUI 的 📌 勾选走这条命令。
+ */
+static void cmd_pin(const char *args) {
+    char sv[12] = {0};
+    if (!args || !param_get(args, "idx", sv, sizeof(sv))) {
+        dap_cmd_err(DAP_ERR_BADARG, "missing_idx");
+        return;
+    }
+    /* on/off 是裸 token 不是 key=value,param_get 取不到,单独扫。
+     * 格式 "@PIN idx=N on|off":跳过 "idx=..." 段后剩下的就是开关词。 */
+    const char *tok = strstr(args, "on");
+    if (!tok || (tok > args && tok[-1] != ' ' && tok[-1] != '&')) {
+        tok = strstr(args, "off");
+    }
+    if (!tok) {
+        dap_cmd_err(DAP_ERR_BADARG, "usage: @PIN idx=N on|off");
+        return;
+    }
+    int idx = atoi(sv);
+    bool on;
+    if (!strncmp(tok, "on", 2)) {
+        on = true;
+    } else if (!strncmp(tok, "off", 3)) {
+        on = false;
+    } else {
+        dap_cmd_err(DAP_ERR_BADARG, "usage: @PIN idx=N on|off");
+        return;
+    }
+    esp_err_t err = dap_config_set_pin(idx, on);
+    if (err != ESP_OK) {
+        dap_cmd_err(DAP_ERR_BADARG, "idx_out_of_range");
+        return;
+    }
+    dap_cmd_ok("pin idx=%d %s", idx, on ? "on" : "off");
 }
 
 static void cmd_factory(const char *args) {
@@ -548,6 +593,7 @@ static const cmd_entry_t s_cmds[] = {
     { "LIST",    cmd_list    },
     { "DEL",     cmd_del     },
     { "PRIO",    cmd_prio    },
+    { "PIN",     cmd_pin     },
     { "MODE",    cmd_mode    },
     { "LED",     cmd_led     },
     { "FACTORY", cmd_factory },
