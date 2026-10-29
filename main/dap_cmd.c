@@ -708,8 +708,27 @@ esp_err_t dap_cmd_init(void) {
         return err;
     }
 
-    /* 把 vfs 的读写切到驱动路径,否则 stdout 绕过驱动、与命令写冲突 */
-    esp_vfs_usb_serial_jtag_use_driver();
+    /* 把 vfs 的读写切到驱动路径,否则 stdout 绕过驱动、与命令写冲突。
+     *
+     * 【2026-10-29 重要修正】不能用 use_driver()!
+     *
+     * use_driver() 把 stdout 的 tx_func 换成 usbjtag_tx_char_via_driver(),
+     * 后者是 `usb_serial_jtag_write_bytes(&ch, 1, portMAX_DELAY)` —— 每次写
+     * **一个字符**且**无限等待**。tx ring buffer(1024B)写满后,只要有任何一个
+     * 线程在打日志,就会永久阻塞在 xRingbufferSend 里。
+     *
+     * 现场表现:板子拔掉 USB 单独上电 → 白灯呼吸一直不变、WiFi 也连不上。
+     * 因为 dap_cmd_init() 在 wifi_init() 之前,而 wifi_init() 里满是
+     * ESP_LOGI("wifi driver ready"/"main network"/"waiting for AP"...),
+     * 没有 USB 主机把这些字节读走,缓冲区一满,wifi_init 就卡死在这儿 ——
+     * LED 永远停在 DAP_LED_BOOT(白色呼吸)。一插上 USB,主机开始取数据,
+     * 缓冲区腾空,阻塞解除,启动流程继续,灯才变色。这就是"插 USB 就好"的原因。
+     *
+     * use_nonblocking() 走的是 usb_serial_jtag_tx_char():直写硬件 FIFO,
+     * FIFO 满 50ms 后主动丢字节,永不阻塞。命令应答和日志都可能被丢,但都有
+     * 上层兜底(命令有 @ 前缀 + PC 侧重试),而"整机启动卡死"是不可接受的。
+     */
+    esp_vfs_usb_serial_jtag_use_nonblocking();
 #else
     ESP_LOGE(TAG, "command channel requires ESP32-S3 or C3");
     return ESP_ERR_NOT_SUPPORTED;
