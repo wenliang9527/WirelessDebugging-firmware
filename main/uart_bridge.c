@@ -102,6 +102,9 @@ static bool is_conn_valid = false; // lock free
 static bool is_first_time_recv = false;
 
 void uart_bridge_close() {
+    if (uart_server_events == NULL) {
+        return; // init 尚未执行(极早期 WiFi 事件),无需通知
+    }
     netconn_events events;
     events.type = NETCONN_EVT_WIFI_DISCONNECTED;
     xQueueSend(uart_server_events, &events, 1000);
@@ -217,7 +220,12 @@ void uart_bridge_init() {
 
 void uart_bridge_task() {
     uart_bridge_setup();
-    uart_server_events = xQueueCreate(EVENTS_QUEUE_SIZE, sizeof(netconn_events));
+    /* 队列已在 uart_bridge_init() 建好(main 里先调 init 再建任务)。
+     * 这里原本又 xQueueCreate 一次 —— 第一次的队列泄漏,而且 wifi 事件里
+     * 的 uart_bridge_close() 可能往旧队列发事件,任务却读新队列。 */
+    if (uart_server_events == NULL) {
+        uart_server_events = xQueueCreate(EVENTS_QUEUE_SIZE, sizeof(netconn_events));
+    }
 
     struct netconn *nc = NULL; // To create servers
 
@@ -237,7 +245,11 @@ void uart_bridge_task() {
         if (ret != pdTRUE) {
             // timeout tick: drain UART into the client
             if (is_conn_valid && uart_netconn != NULL) {
-                ESP_ERROR_CHECK(uart_get_buffered_data_len(UART_BRIDGE_RX, &uart_buf_len));
+                // 不要用 ESP_ERROR_CHECK:拿不到长度只该跳过这一轮,
+                // 不该 abort 整机(历史上这里 abort 过一次就重启)。
+                if (uart_get_buffered_data_len(UART_BRIDGE_RX, &uart_buf_len) != ESP_OK) {
+                    uart_buf_len = 0;
+                }
                 uart_buf_len = uart_buf_len > UART_BUF_SIZE ? UART_BUF_SIZE : uart_buf_len;
                 uart_buf_len = uart_read_bytes(UART_BRIDGE_RX, uart_read_buffer, uart_buf_len, pdMS_TO_TICKS(5));
                 if (uart_buf_len > 0 && netconn_write(uart_netconn, uart_read_buffer, uart_buf_len, NETCONN_COPY) != ERR_OK) {
@@ -274,8 +286,10 @@ void uart_bridge_task() {
             //     tcp_nagle_disable(events.nc->pcb.tcp);
 
             uart_netconn = events.nc;
-            // read data from UART
-            ESP_ERROR_CHECK(uart_get_buffered_data_len(UART_BRIDGE_RX, &uart_buf_len));
+            // read data from UART(同 tick 分支:错误只跳过,不 abort)
+            if (uart_get_buffered_data_len(UART_BRIDGE_RX, &uart_buf_len) != ESP_OK) {
+                uart_buf_len = 0;
+            }
             uart_buf_len = uart_buf_len > UART_BUF_SIZE ? UART_BUF_SIZE : uart_buf_len;
             uart_buf_len = uart_read_bytes(UART_BRIDGE_RX, uart_read_buffer, uart_buf_len, pdMS_TO_TICKS(5));
             // then send data

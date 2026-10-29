@@ -167,13 +167,20 @@ void app_main() {
     xTaskCreatePinnedToCore(DAP_Thread, "DAP_Task", 2048, NULL, 10, &kDAPTaskHandle,
                             DAP_TASK_AFFINITY);
 
+/* 串口桥任务栈:原 2048 太小,实测(2026-10-29)只要 client 被 accept 就爆栈:
+ *   I (88121) UART: client accepted
+ *   ***ERROR*** A stack overflow in task uart_server has been detected.
+ *   Backtrace: panic_abort <- esp_system_abort <- vApplicationStackOverflowHook
+ * 每次连 1234 都触发一次 esp_restart(RTC_SW_CPU_RST),表现为"板子反复重启、
+ * 1234 时而连不上"。爆栈点是 netconn_accept/netconn_recv 那几层 lwIP 调用,
+ * 它们内部要几百字节到 1KB 不等的临时栈。给到 6144(与原 FIXME 对应)。
+ * ESP8266 路线维持原值 1024 不动:它的 RAM 极紧且手头无板可验。 */
 #if defined CONFIG_IDF_TARGET_ESP8266
     #define UART_BRIDGE_TASK_STACK_SIZE 1024
 #else
-    #define UART_BRIDGE_TASK_STACK_SIZE 2048
+    #define UART_BRIDGE_TASK_STACK_SIZE 6144
 #endif
 
-    //// FIXME: potential stack overflow
 #if (USE_UART_BRIDGE == 1)
     xTaskCreate(uart_bridge_task, "uart_server", UART_BRIDGE_TASK_STACK_SIZE, NULL, 2, NULL);
 #endif
