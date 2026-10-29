@@ -105,6 +105,40 @@ uint8_t   dap_config_get_mode_pref(void);
 esp_err_t dap_config_set_led_brightness(uint8_t pct);
 uint8_t   dap_config_get_led_brightness(void);
 
+/* ------------------------------------------------------------------ */
+/* AP 热点密码                                                         */
+/* ------------------------------------------------------------------ */
+/**
+ * AP 热点密码缓冲区长度(含结尾 0)。
+ *
+ * 取 10 位而不是常见的 8 位:WPA2-PSK 最少 8 位,10 位在同样的易读性下
+ * 多两位熵。字符表刻意去掉容易看错的 0/O、1/I/l、2/Z、5/S —— 用户很可能
+ * 是在手机小键盘上照着板子背面的标签敲。
+ */
+#define DAP_CFG_AP_PASS_LEN   11   /* 10 字符 + 结尾 0 */
+#define DAP_CFG_AP_PASS_CHARS 10
+
+/**
+ * 取当前 AP 热点密码。
+ *
+ * 首次调用(或 NVS 里还没有时)会**生成一个随机密码并落盘**,之后恒定。
+ * 生成源是 esp_random():ESP32-S3 的硬件 RNG,开机即用,不需要额外熵源。
+ * 再与 eFuse MAC 混一次,保证同批次板子即使 RNG 起步状态相近也不会撞密码。
+ *
+ * 为什么不再用全局常量 "12345678":那个密码是公开的(源码 + 所有文档),
+ * 等于没有密码,卖出去的板子谁都能连上它的 AP。
+ *
+ * 恢复出厂**不清这个密码**(见 dap_config_factory_reset 里的说明)——
+ * 密码是设备身份的一部分,不是"用户配置"。想换密码用 @AP REGEN。
+ */
+const char *dap_config_get_ap_password(void);
+
+/**
+ * 重新生成 AP 密码并落盘。返回新密码(静态缓冲区,不要 free)。
+ * 仅供 @AP REGEN(排障/交接)使用,日常不需要换。
+ */
+const char *dap_config_regen_ap_password(void);
+
 #ifdef __cplusplus
 }
 #endif

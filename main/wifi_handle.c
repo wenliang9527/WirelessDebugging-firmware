@@ -71,11 +71,13 @@ static inline void led_indicate(dap_led_state_t st)
 
 static const char *TAG = "wifi";
 
-/* AP 参数(E3 默认值) */
+/* AP 参数 */
 #define AP_SSID_PREFIX    "DAP-"
-#define AP_PASSWORD       "12345678"
 #define AP_CHANNEL        6
 #define AP_MAX_CONN       4
+/* 密码不再写死:由 dap_config_get_ap_password() 提供(首启随机生成、存 NVS)。
+ * 原来这里是 #define AP_PASSWORD "12345678" —— 那个串在源码和所有文档里
+ * 都是公开的,等于热点没密码。 */
 
 /* 启动时最长等 IP 的时间。超时不算失败,只是让命令通道先能用;
  * 之后 STA 仍会在后台重试主网。 */
@@ -359,7 +361,10 @@ static esp_err_t apply_ap_mode(void) {
     cfg.ap.ssid_len = (uint8_t)strlen(s_ap_ssid);
     memcpy(cfg.ap.ssid, s_ap_ssid, cfg.ap.ssid_len);
     cfg.ap.ssid[cfg.ap.ssid_len] = '\0';
-    strncpy((char *)cfg.ap.password, AP_PASSWORD, sizeof(cfg.ap.password) - 1);
+    /* 密码来自 NVS(首启随机生成)。get 保证非空 —— 空密码会让 AP 变开放
+     * 网络,WPA2 的 authmode 又要求至少 8 位,配置会直接失败。 */
+    const char *ap_pass = dap_config_get_ap_password();
+    strncpy((char *)cfg.ap.password, ap_pass, sizeof(cfg.ap.password) - 1);
     cfg.ap.channel = AP_CHANNEL;
     cfg.ap.max_connection = AP_MAX_CONN;
     cfg.ap.authmode = WIFI_AUTH_WPA2_PSK;
@@ -646,7 +651,10 @@ void wifi_init(void) {
 
     if (s_mode == DAP_MODE_AP) {
         ESP_ERROR_CHECK(apply_ap_mode());
-        ESP_LOGI(TAG, "AP ready: ssid=%s ip=192.168.4.1", s_ap_ssid);
+        /* 密码不进日志。现场排障要密码时走 @AP(USB 命令通道),
+         * 那是可控的本地通道;ESP_LOG 会进串口日志、用户会截图发群里。 */
+        ESP_LOGI(TAG, "AP ready: ssid=%s ip=192.168.4.1 (password via @AP)",
+                 s_ap_ssid);
         dap_cmd_set_wifi_ready(true);
         return;
     }

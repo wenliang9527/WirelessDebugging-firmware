@@ -580,6 +580,49 @@ static void cmd_led(const char *args) {
 }
 
 /* ------------------------------------------------------------------ */
+/* AP 热点信息                                                         */
+/* ------------------------------------------------------------------ */
+/**
+ * @AP          读当前 AP 参数(SSID + 密码)
+ * @AP REGEN    重新生成密码(不动 SSID),下次切模式/重启生效
+ *
+ * 为什么单独开一条命令而不是塞进 @STATUS:
+ *   密码是敏感信息,只有**用户主动要看**时才该出现在输出里。@STATUS 是
+ *   每次连上都会自动发的,把密码塞进去等于让它天天躺在日志文件里。
+ *
+ * 本命令只在 USB 命令通道上可达(固件不暴露 TCP 版命令通道),所以"知道
+ * 密码"的门槛 = 物理接触板子 + 有 USB 线,这正是我们想要的门槛。
+ */
+static void cmd_ap(const char *args) {
+    char sub[16] = {0};
+    if (args) {
+        sscanf(args, "%15s", sub);
+    }
+
+    if (sub[0] != '\0') {
+        /* 项目里没有 <strings.h>,其他地方的大小写折叠都是手写 toupper
+         * (见 dispatch_line)。跟着用同一套,别为一个比较引入新头文件。 */
+        for (char *q = sub; *q; q++) {
+            *q = (char)toupper((unsigned char)*q);
+        }
+        if (strcmp(sub, "REGEN") != 0) {
+            dap_cmd_err(DAP_ERR_BADARG, "usage: @AP or @AP REGEN");
+            return;
+        }
+        dap_config_regen_ap_password();
+        /* 新密码要等下一次 apply_ap_mode 才生效(切模式或重启)。不在这里
+         * 自动切 —— 切模式会踢掉当前连接,而用户可能只是想先把密码换好。
+         * note= 字段让 PC 侧能把这句话原样转述,不必自己猜。 */
+        dap_cmd_ok("ap ssid=%s pass=%s note=applies_on_next_mode_switch",
+                   dap_cmd_ap_ssid(), dap_config_get_ap_password());
+        return;
+    }
+
+    dap_cmd_ok("ap ssid=%s pass=%s", dap_cmd_ap_ssid(),
+               dap_config_get_ap_password());
+}
+
+/* ------------------------------------------------------------------ */
 /* 分发                                                                */
 /* ------------------------------------------------------------------ */
 
@@ -599,6 +642,7 @@ static const cmd_entry_t s_cmds[] = {
     { "PIN",     cmd_pin     },
     { "MODE",    cmd_mode    },
     { "LED",     cmd_led     },
+    { "AP",      cmd_ap      },
     { "FACTORY", cmd_factory },
     { "REBOOT",  cmd_reboot  },
 };
