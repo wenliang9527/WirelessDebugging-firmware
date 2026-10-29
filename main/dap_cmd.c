@@ -234,8 +234,11 @@ static void cmd_status(const char *args) {
             rssi = ap.rssi;
             ch = ap.primary;
         }
-        dap_cmd_ok("mode=%s ssid=%s ip=%s rssi=%d ch=%d",
-                   dap_cmd_mode_name(), ssid, ipstr, rssi, ch);
+        /* prov=1 标记未配网态:一条已保存网络都没有。PC 工具据此把
+         * "STA 未连接"的提示换成"等待配网"引导,而不是误导用户去查路由器。 */
+        dap_cmd_ok("mode=%s ssid=%s ip=%s rssi=%d ch=%d prov=%d",
+                   dap_cmd_mode_name(), ssid, ipstr, rssi, ch,
+                   (dap_config_count() == 0) ? 1 : 0);
     } else {
         tcpip_adapter_ip_info_t ip;
         char ipstr[16] = "0.0.0.0";

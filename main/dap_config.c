@@ -66,7 +66,10 @@ static void key_pin(int idx, char *buf, size_t len) {
     snprintf(buf, len, "ap%d_pin", idx);
 }
 
-/** 把编译期列表复制进内存镜像(出厂默认) */
+/** 把编译期列表复制进内存镜像(出厂默认)。
+ * 产品化主网模型:出厂 = 未配网,编译期列表不再参与(凭据一律经工具配网落 NVS)。
+ * 本地开发者的 wifi_credentials.h 仍可编译进固件当开发便利,但走的是
+ * "用户配置"通道而非出厂通道 —— 这里保持读它,行为与老版本兼容。 */
 static void load_factory_list(void) {
     s_count = 0;
     int n = (int)WIFI_LIST_SIZE;

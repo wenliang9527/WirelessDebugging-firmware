@@ -1,12 +1,14 @@
 /**
  * @file wifi_handle.c
- * @brief WiFi 初始化、STA 连接轮询、AP 模式启停
+ * @brief WiFi 初始化、STA 主网连接、AP 模式启停
  *
- * 产品化 P1 改动:
- *   - 保留上游的 STA 多 SSID 轮转(基于编译期列表 / 本地凭据文件)
+ * 产品化主网模型(2026-10-29 定稿):
+ *   - 不做多 SSID 轮转。主网 = 连接顺序逻辑 0(pin 过的最靠前,否则最近连的),
+ *     连不上只按退避序列重试同一条(1/2/5/10/15/30s),绝不自动换网。
+ *     理由:多网段环境里轮转会造成 IP 漂移,PC 端表现为"连接不稳定"。
+ *   - 换主网只能走 PC 工具(@CONNECT / @PIN);恢复出厂后回到未配网态。
  *   - 新增 AP 模式:仅由 @MODE AP 命令触发,不自动降级(C2 约束)
  *   - 新增模式偏好 NVS 持久化,重启后保持上次模式
- *   - 模式切换用 stop -> set_mode -> set_config -> start 序列
  */
 #include "sdkconfig.h"
 
@@ -28,6 +30,7 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/timers.h"
 #include "freertos/event_groups.h"
 #include "esp_system.h"
 #include "esp_wifi.h"
@@ -75,20 +78,32 @@ static const char *TAG = "wifi";
 #define AP_MAX_CONN       4
 
 /* 启动时最长等 IP 的时间。超时不算失败,只是让命令通道先能用;
- * 之后 STA 仍会在后台按列表轮转重连。 */
+ * 之后 STA 仍会在后台重试主网。 */
 #define STA_BOOT_WAIT_MS  20000
+
+/* 主网重试退避:连不上时按这个序列循环等待(毫秒)。
+ * 单主网模型下没有"下一个网络"可换,重试太密只会空耗 RF;
+ * 最长 30s 一拍,连上即归零。 */
+static const int s_retry_backoff_ms[] = { 1000, 2000, 5000, 10000, 15000, 30000 };
+#define RETRY_BACKOFF_N   (sizeof(s_retry_backoff_ms) / sizeof(s_retry_backoff_ms[0]))
+
+/* 当前退避档位与定时器(断连回调里不能 delay,重连交给定时器) */
+static volatile int s_retry_stage = 0;
+static TimerHandle_t s_retry_timer = NULL;
 
 /* 单次手动连接(@CONNECT)的等待上限 */
 #define MANUAL_CONNECT_TIMEOUT_MS 20000
 
 static EventGroupHandle_t wifi_event_group;
-static int ssid_index = 0;
 
 static volatile dap_mode_t s_mode = DAP_MODE_STA;
 static char s_ap_ssid[33] = AP_SSID_PREFIX "0000";
 
 const int IPV4_GOTIP_BIT = BIT0;
 
+/* 自动重连要试的目标:主网 = 列表里 pin 过的最靠前一条,没 pin 就是第 0 条
+ * (即"最近连上的")。连接顺序由 dap_config_conn_physical() 定义,
+ * 这里永远只取逻辑 0,不轮转 —— 用户模型:连不上就等,换网走工具。 */
 static void ssid_change(void);
 
 /* ------------------------------------------------------------------ */
@@ -154,8 +169,7 @@ static esp_err_t event_handler(void *ctx, system_event_t *event) {
     switch (event->event_id) {
     case SYSTEM_EVENT_STA_START:
         if (s_mode == DAP_MODE_STA) {
-            /* STA 刚启动:写入列表里待尝试的 SSID 再连接。
-             * ssid_change() 只在断连回调与这里被调用,避免重复推进游标。 */
+            /* STA 刚启动:写主网再连接。没有已保存网络时不连(未配网态)。 */
             ssid_change();
             esp_wifi_connect();
         }
@@ -169,6 +183,7 @@ static esp_err_t event_handler(void *ctx, system_event_t *event) {
 
     case SYSTEM_EVENT_STA_GOT_IP:
         led_indicate(DAP_LED_STA_OK);
+        s_retry_stage = 0;   /* 连上归零,下次断连从头退避 */
         xEventGroupSetBits(wifi_event_group, IPV4_GOTIP_BIT);
         ESP_LOGI(TAG, "STA got ip: %s", ip4addr_ntoa(&event->event_info.got_ip.ip_info.ip));
         if (s_manual) {
@@ -179,13 +194,10 @@ static esp_err_t event_handler(void *ctx, system_event_t *event) {
             if (dap_config_add(s_manual_ssid, s_manual_pass) != ESP_OK) {
                 ESP_LOGW(TAG, "failed to persist %s", s_manual_ssid);
             }
-            ssid_index = 0;
         }
         break;
 
     case SYSTEM_EVENT_STA_DISCONNECTED:
-        /* 断连后仍在按列表轮转,所以是"连接中";只有整轮都失败才该报故障,
-         * 这里不区分那么细,统一用缓慢黄色闪烁提示"还没连上"。 */
         led_indicate(DAP_LED_CONNECTING);
         ESP_LOGW(TAG, "disconnect reason: %d", (int)info->disconnected.reason);
 
@@ -202,7 +214,7 @@ static esp_err_t event_handler(void *ctx, system_event_t *event) {
 #endif
 
         if (s_scanning) {
-            /* 扫描前主动断开的,不代表连接失败 —— 忽略,别推进轮转游标 */
+            /* 扫描前主动断开的,不代表连接失败 —— 忽略 */
             ESP_LOGI(TAG, "scan: own disconnect ignored (reason=%d)",
                      (int)info->disconnected.reason);
             break;
@@ -215,15 +227,14 @@ static esp_err_t event_handler(void *ctx, system_event_t *event) {
             break;
         }
         if (s_manual) {
-            /* 手动连接期间不轮转:如实记录原因码交给 @CONNECT 上报。 */
+            /* 手动连接期间不自动重试:如实记录原因码交给 @CONNECT 上报,
+             * 由回调侧恢复主网重连。 */
             s_manual_reason = (int)info->disconnected.reason;
             s_manual_ok = false;
             s_manual_done = true;
             s_manual = false;
             ESP_LOGW(TAG, "manual connect to %s failed, reason=%d",
                      s_manual_ssid, s_manual_reason);
-            /* 恢复自动轮转 */
-            ssid_index = 0;
             if (s_mode == DAP_MODE_STA) {
                 ssid_change();
                 esp_wifi_connect();
@@ -231,10 +242,18 @@ static esp_err_t event_handler(void *ctx, system_event_t *event) {
             break;
         }
 
-        /* 产品化约束 C2:不自动降级到 AP。仅 STA 模式下继续轮转重连。 */
+        /* 主网模型:没有"下一个网络"可换,按退避序列重试同一条。
+         * 产品化约束 C2:不自动降级到 AP;换网只能走工具。 */
         if (s_mode == DAP_MODE_STA) {
+            int wait = s_retry_backoff_ms[s_retry_stage];
+            if (s_retry_stage < (int)RETRY_BACKOFF_N - 1) {
+                s_retry_stage++;
+            }
             ssid_change();
-            esp_wifi_connect();
+            ESP_LOGI(TAG, "retry main network in %d ms", wait);
+            /* 事件回调里不能 vTaskDelay(卡住整个 WiFi 任务):改定时器周期
+             * 后单发触发,回调里 esp_wifi_connect()。 */
+            xTimerChangePeriod(s_retry_timer, pdMS_TO_TICKS(wait), 0);
         }
         break;
 
@@ -264,23 +283,21 @@ static esp_err_t event_handler(void *ctx, system_event_t *event) {
 static void ssid_change(void) {
     int n = dap_config_count();
     if (n <= 0) {
-        /* 理论上不会发生(出厂列表至少有一条),兜底避免除零/空转 */
-        ESP_LOGW(TAG, "no configured network");
+        /* 未配网态:没有任何已保存网络。什么都不做,等 PC 工具经 USB 配网。
+         * LED 由 STA_START 分支置红色快闪提示。 */
+        ESP_LOGW(TAG, "no configured network; waiting for provisioning via USB");
+        led_indicate(DAP_LED_FAULT);
         return;
     }
-    if (ssid_index < 0 || ssid_index >= n) {
-        ssid_index = 0;
-    }
-    /* ssid_index 是"逻辑序号"(连接顺序),不是物理下标:
-     * pin 过的网络永远排在前面,映射由 dap_config_conn_physical() 完成。 */
-    int phys = dap_config_conn_physical(ssid_index);
+    /* 主网 = 连接顺序里的逻辑 0:pin 过的最靠前一条,没 pin 就是最近连的。
+     * 映射由 dap_config_conn_physical() 完成,这里永远只取 0,不轮转。 */
+    int phys = dap_config_conn_physical(0);
     if (phys < 0) {
         phys = 0;
     }
 
     dap_cfg_ap_t ap;
     if (!dap_config_get(phys, &ap)) {
-        ssid_index = 0;
         return;
     }
 
@@ -289,9 +306,8 @@ static void ssid_change(void) {
      * 数组容量(33/65),不加精度限定会触发 -Werror=format-truncation。 */
     snprintf((char *)wifi_config.sta.ssid, sizeof(wifi_config.sta.ssid), "%.31s", ap.ssid);
     snprintf((char *)wifi_config.sta.password, sizeof(wifi_config.sta.password), "%.63s", ap.password);
-    ESP_LOGI(TAG, "trying ssid[%d/%d]: %s%s", ssid_index, n, wifi_config.sta.ssid,
+    ESP_LOGI(TAG, "main network: %s%s", wifi_config.sta.ssid,
              ap.pin ? " (pinned)" : "");
-    ssid_index++;
 
     /* 绝对不能用 ESP_ERROR_CHECK:它在失败时直接 abort,整块板子 panic 重启。
      *
@@ -302,14 +318,21 @@ static void ssid_change(void) {
      * 触发条件:WiFi 驱动正处于连接中/扫描中时,set_config 返回
      * ESP_ERR_WIFI_STATE。而 ssid_change() 恰恰是在 STA_DISCONNECTED 回调
      * 里被调用的 —— 那一刻驱动正在从断开态往重连态过渡,状态极不稳定。
-     * 于是"换个网络试试"这个最普通的动作能把板子打崩。
      *
-     * 正确做法:失败就跳过这一轮。下一次 DISCONNECTED 事件会再来一次,
-     * 驱动那时通常已稳定。宁可少试一轮,也不能崩。 */
+     * 正确做法:失败就跳过这一轮。重试定时器会再来一次。 */
     esp_err_t cfg_err = esp_wifi_set_config(ESP_IF_WIFI_STA, &wifi_config);
     if (cfg_err != ESP_OK) {
-        ESP_LOGW(TAG, "set_config(%s) failed: %s; skip this round",
+        ESP_LOGW(TAG, "set_config(%s) failed: %s; retry later",
                  wifi_config.sta.ssid, esp_err_to_name(cfg_err));
+    }
+}
+
+/* 重试定时器回调:到点后按主网配置发起连接。
+ * 放在定时器里是因为 DISCONNECTED 回调不能 vTaskDelay。 */
+static void retry_timer_cb(TimerHandle_t t) {
+    (void)t;
+    if (s_mode == DAP_MODE_STA && !s_manual && !s_scanning) {
+        esp_wifi_connect();
     }
 }
 
@@ -325,11 +348,9 @@ static esp_err_t apply_sta_mode(void) {
     }
     /* 清空当前 STA 配置,避免沿用 AP 模式前的残留 */
     esp_wifi_set_config(ESP_IF_WIFI_STA, &cfg);
-    /* 从 list[0] 开始。这里只重置游标,不自己调 ssid_change():
-     * esp_wifi_start() 会触发 STA_START,由事件处理统一写入首个 SSID 并连接。
-     * 若在此处也调一次,首个 SSID 会被跳过(实测表现为切回 STA 后直接去试
-     * 列表末位的 OTA,反复 201)。 */
-    ssid_index = 0;
+    /* 不在这里写 SSID:esp_wifi_start() 会触发 STA_START,由事件处理统一
+     * 写主网并连接(未配网态则置故障灯等待配网)。 */
+    s_retry_stage = 0;
     return esp_wifi_start();
 }
 
@@ -632,9 +653,13 @@ void wifi_init(void) {
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
+    /* 重试定时器:单发,到点回调里 esp_wifi_connect()。断连事件按退避档位
+     * xTimerReset 设定周期;连上后 GOT_IP 清零档位。 */
+    s_retry_timer = xTimerCreate("sta_retry", pdMS_TO_TICKS(1000),
+                                 pdFALSE, NULL, retry_timer_cb);
     /* 不在这里写 SSID:交给 STA_START 事件统一处理,保证"启动"和"切回 STA"
-     * 走同一条路径,游标不会因两处各推一次而错位。 */
-    ssid_index = 0;
+     * 走同一条路径。 */
+    s_retry_stage = 0;
     ESP_ERROR_CHECK(esp_wifi_start());
 
     /* 门闩在这里就该放开:esp_wifi_start() 返回时 WiFi 驱动已经可接受

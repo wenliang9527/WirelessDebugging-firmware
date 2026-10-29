@@ -27,17 +27,18 @@
 #ifndef WIFI_LIST_IS_FACTORY_DEFAULT
 #define WIFI_LIST_IS_FACTORY_DEFAULT 1
 
+/* 产品化主网模型(2026-10-29):出厂 = 未配网。
+ * 凭据一律由 PC 工具经 USB 配网(@CONNECT)写入 NVS;固件不内置任何
+ * 默认 WiFi —— 消掉"出厂默认密码 12345678"这个已知凭据隐患。
+ * 本地开发者仍可建 main/wifi_credentials.h(已 gitignore)做开发便利。 */
 static struct {
     const char *ssid;
     const char *password;
 } wifi_list[] __attribute__((unused)) = {
-    // 出厂默认:与上游一致,配合手机/PC 热点使用
-    // 产品化阶段(P2)后,这份列表降级为"无 NVS 配置时的初始候选"
-    {.ssid = "DAP", .password = "12345678"},
-    {.ssid = "OTA", .password = "12345678"},
+    {0, 0},
 };
 
-#define WIFI_LIST_SIZE (sizeof(wifi_list) / sizeof(wifi_list[0]))
+#define WIFI_LIST_SIZE 0
 
 #endif // WIFI_LIST_IS_FACTORY_DEFAULT
 
