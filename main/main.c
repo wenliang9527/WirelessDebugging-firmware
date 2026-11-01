@@ -164,7 +164,10 @@ void app_main() {
 #endif
 
     // DAP handle task
-    xTaskCreatePinnedToCore(DAP_Thread, "DAP_Task", 2048, NULL, 10, &kDAPTaskHandle,
+    // 栈 2048 -> 4096(体检 A-2,2026-11-01):uart_server 当年就是 2048 爆的栈
+    // (lwIP/netconn 那几层要 0.5-1KB 临时栈),DAP_Thread 里 DAP_ProcessCommand
+    // 的调用深度同类。未观测到溢出,但它是全项目最后一个 2048 级任务,S3 RAM 充裕。
+    xTaskCreatePinnedToCore(DAP_Thread, "DAP_Task", 4096, NULL, 10, &kDAPTaskHandle,
                             DAP_TASK_AFFINITY);
 
 /* 串口桥任务栈:原 2048 太小,实测(2026-10-29)只要 client 被 accept 就爆栈:

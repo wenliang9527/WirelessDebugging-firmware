@@ -29,6 +29,9 @@
 #include "nvs.h"
 #include "nvs_flash.h"
 
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+
 static const char *TAG = "dap.cfg";
 
 #define NVS_NS          "dap_cfg"
@@ -48,6 +51,27 @@ static bool s_factory = true;   /* true = 用的是编译期出厂列表 */
 static uint8_t s_mode_pref = 0; /* 0=STA 1=AP */
 static uint8_t s_led_pct = DAP_CFG_LED_DEFAULT_PCT;
 static char s_ap_pass[DAP_CFG_AP_PASS_LEN] = {0};  /* 空 = 还没生成 */
+
+/* ------------------------------------------------------------------ */
+/* 并发控制(体检 A-1,2026-11-01)                                      */
+/* ------------------------------------------------------------------ */
+/* 内存镜像(s_aps/s_count/s_mode_pref/s_led_pct/s_ap_pass)有两个写者:
+ *   - cmd_task(USB 命令:@DEL/@PIN/@LED,以及 @CONNECT 成功落盘)
+ *   - WiFi 事件回调(GOT_IP -> dap_config_add() 整表重写;ssid_change() 读)
+ * 两者分属不同任务,此前无任何保护:@CONNECT 拿到 IP 的瞬间与 PC 侧的
+ * @LIST/@DEL 并发,会撕裂读/写。这里用一把递归互斥罩住全部公开接口 ——
+ * 条目 <= 5、操作都是毫秒级 NVS 读写,锁开销可忽略。
+ * 用递归锁的唯一原因:dap_config_init() 会调 dap_config_regen_ap_password()
+ * (公开接口),非递归锁会自锁;除此之外没有公开 -> 公开调用。 */
+static SemaphoreHandle_t s_cfg_mux = NULL;
+
+static void cfg_lock(void) {
+    xSemaphoreTakeRecursive(s_cfg_mux, portMAX_DELAY);
+}
+
+static void cfg_unlock(void) {
+    xSemaphoreGiveRecursive(s_cfg_mux);
+}
 
 /* ------------------------------------------------------------------ */
 
@@ -224,6 +248,10 @@ esp_err_t dap_config_init(void) {
     if (s_ready) {
         return ESP_OK;
     }
+    /* 先建锁:cmd_task 在 dap_cmd_init() 之后才存在、WiFi 事件循环更晚,
+     * 此处是全流程唯一的无并发窗口,保证此后所有公开接口都拿得到锁。 */
+    s_cfg_mux = xSemaphoreCreateRecursiveMutex();
+    cfg_lock();
     s_count = 0;
     s_mode_pref = 0;
     s_factory = true;
@@ -255,19 +283,28 @@ esp_err_t dap_config_init(void) {
     } else {
         ESP_LOGI(TAG, "AP password loaded (device identity)");
     }
+    cfg_unlock();
     return ESP_OK;
 }
 
 int dap_config_count(void) {
-    return s_count;
+    cfg_lock();
+    int n = s_count;
+    cfg_unlock();
+    return n;
 }
 
 bool dap_config_get(int idx, dap_cfg_ap_t *out) {
-    if (!out || idx < 0 || idx >= s_count) {
+    if (!out || idx < 0) {
         return false;
     }
-    *out = s_aps[idx];
-    return true;
+    cfg_lock();
+    bool ok = (idx < s_count);
+    if (ok) {
+        *out = s_aps[idx];
+    }
+    cfg_unlock();
+    return ok;
 }
 
 esp_err_t dap_config_add(const char *ssid, const char *password) {
@@ -275,6 +312,7 @@ esp_err_t dap_config_add(const char *ssid, const char *password) {
         return ESP_ERR_INVALID_ARG;
     }
 
+    cfg_lock();
     /* 已存在同 SSID:更新密码并置顶,避免同一网络堆多条 */
     int found = -1;
     for (int i = 0; i < s_count; i++) {
@@ -306,11 +344,15 @@ esp_err_t dap_config_add(const char *ssid, const char *password) {
         s_aps[0].pin = 0;
     }
 
-    return save_all();
+    esp_err_t err = save_all();
+    cfg_unlock();
+    return err;
 }
 
 esp_err_t dap_config_del(int idx) {
+    cfg_lock();
     if (idx < 0 || idx >= s_count) {
+        cfg_unlock();
         return ESP_ERR_INVALID_ARG;
     }
     for (int i = idx; i < s_count - 1; i++) {
@@ -318,14 +360,19 @@ esp_err_t dap_config_del(int idx) {
     }
     s_count--;
     memset(&s_aps[s_count], 0, sizeof(s_aps[0]));
-    return save_all();
+    esp_err_t err = save_all();
+    cfg_unlock();
+    return err;
 }
 
 esp_err_t dap_config_prioritize(int idx) {
+    cfg_lock();
     if (idx < 0 || idx >= s_count) {
+        cfg_unlock();
         return ESP_ERR_INVALID_ARG;
     }
     if (idx == 0) {
+        cfg_unlock();
         return ESP_OK;  /* 已经在最前,不必写 NVS */
     }
     /* 抽出来再前插,其余元素的相对顺序保持不变。
@@ -336,74 +383,98 @@ esp_err_t dap_config_prioritize(int idx) {
         s_aps[i] = s_aps[i - 1];
     }
     s_aps[0] = tmp;
-    return save_all();
+    esp_err_t err = save_all();
+    cfg_unlock();
+    return err;
 }
 
 esp_err_t dap_config_set_pin(int idx, bool pin) {
+    cfg_lock();
     if (idx < 0 || idx >= s_count) {
+        cfg_unlock();
         return ESP_ERR_INVALID_ARG;
     }
     uint8_t v = pin ? 1 : 0;
     if (s_aps[idx].pin == v) {
+        cfg_unlock();
         return ESP_OK;  /* 幂等:状态没变就不写 NVS */
     }
     s_aps[idx].pin = v;
-    return save_all();
+    esp_err_t err = save_all();
+    cfg_unlock();
+    return err;
 }
 
 bool dap_config_pin_at(int idx) {
-    if (idx < 0 || idx >= s_count) {
-        return false;
-    }
-    return s_aps[idx].pin != 0;
+    cfg_lock();
+    bool ok = (idx >= 0 && idx < s_count) && (s_aps[idx].pin != 0);
+    cfg_unlock();
+    return ok;
 }
 
 int dap_config_conn_physical(int logical) {
+    cfg_lock();
     if (logical < 0 || logical >= s_count) {
+        cfg_unlock();
         return -1;
     }
     /* 计算序 = pin 过的在前(组内保持物理序),未 pin 的跟随其后(即 LRU:
      * @CONNECT 自动置顶让"最近连过的"排物理最前,这里自然继承)。
      * 轮转游标 ssid_index 从此是"逻辑序号",看不懂这层映射的调用方
-     * (dap_config_get 直取)不受影响。 */
+     * (dap_config_get 直取)不受影响。
+     * 加锁改写:结果统一用 phys 变量带出,避免中途 return 漏解锁。 */
+    int phys = -1;
     int pinned_seen = 0;
     for (int i = 0; i < s_count; i++) {
         if (s_aps[i].pin) {
             if (logical == pinned_seen) {
-                return i;
+                phys = i;
+                break;
             }
             pinned_seen++;
         }
     }
-    int unpinned_seen = 0;
-    for (int i = 0; i < s_count; i++) {
-        if (!s_aps[i].pin) {
-            if (logical - pinned_seen == unpinned_seen) {
-                return i;
+    if (phys < 0) {
+        int unpinned_seen = 0;
+        for (int i = 0; i < s_count; i++) {
+            if (!s_aps[i].pin) {
+                if (logical - pinned_seen == unpinned_seen) {
+                    phys = i;
+                    break;
+                }
+                unpinned_seen++;
             }
-            unpinned_seen++;
         }
     }
-    return -1;  /* 不可达:logical 已在入口挡住越界 */
+    cfg_unlock();
+    return phys;
 }
 
 int dap_config_index_of(const char *ssid) {
     if (!ssid || ssid[0] == '\0') {
         return -1;
     }
+    cfg_lock();
+    int found = -1;
     for (int i = 0; i < s_count; i++) {
         if (strcmp(s_aps[i].ssid, ssid) == 0) {
-            return i;
+            found = i;
+            break;
         }
     }
-    return -1;
+    cfg_unlock();
+    return found;
 }
 
 bool dap_config_using_factory(void) {
-    return s_factory;
+    cfg_lock();
+    bool f = s_factory;
+    cfg_unlock();
+    return f;
 }
 
 esp_err_t dap_config_factory_reset(void) {
+    cfg_lock();
     /* AP 密码是**设备身份**,不是"用户配置" —— 恢复出厂不该把它换掉。
      * 理由:
      *   1. 用户可能已经把密码抄在板子背面的标签上;悄悄换掉会让人彻底
@@ -434,18 +505,23 @@ esp_err_t dap_config_factory_reset(void) {
     s_led_pct = DAP_CFG_LED_DEFAULT_PCT;   /* 亮度也回默认 */
     snprintf(s_ap_pass, sizeof(s_ap_pass), "%s", saved_pass);
     load_factory_list();
+    cfg_unlock();
     return err;
 }
 
 esp_err_t dap_config_set_mode_pref(uint8_t mode) {
+    cfg_lock();
     s_mode_pref = (mode == 1) ? 1 : 0;
     /* 只有用户配置存在时才写盘;否则只改内存,避免为一条偏好创建命名空间 */
     if (!s_factory) {
-        return save_all();
+        esp_err_t err = save_all();
+        cfg_unlock();
+        return err;
     }
     nvs_handle_t h;
     esp_err_t err = nvs_open(NVS_NS, NVS_READWRITE, &h);
     if (err != ESP_OK) {
+        cfg_unlock();
         return err;
     }
     err = nvs_set_u8(h, KEY_MODE, s_mode_pref);
@@ -453,11 +529,15 @@ esp_err_t dap_config_set_mode_pref(uint8_t mode) {
         err = nvs_commit(h);
     }
     nvs_close(h);
+    cfg_unlock();
     return err;
 }
 
 uint8_t dap_config_get_mode_pref(void) {
-    return s_mode_pref;
+    cfg_lock();
+    uint8_t m = s_mode_pref;
+    cfg_unlock();
+    return m;
 }
 
 /* ------------------------------------------------------------------ */
@@ -468,6 +548,7 @@ esp_err_t dap_config_set_led_brightness(uint8_t pct) {
     if (pct < DAP_CFG_LED_MIN_PCT || pct > DAP_CFG_LED_MAX_PCT) {
         return ESP_ERR_INVALID_ARG;
     }
+    cfg_lock();
     s_led_pct = pct;
 
     /* 亮度是独立键,单独写一个就够了 —— 不必整表重写。
@@ -475,6 +556,7 @@ esp_err_t dap_config_set_led_brightness(uint8_t pct) {
     nvs_handle_t h;
     esp_err_t err = nvs_open(NVS_NS, NVS_READWRITE, &h);
     if (err != ESP_OK) {
+        cfg_unlock();
         return err;
     }
     err = nvs_set_u8(h, KEY_LED_PCT, s_led_pct);
@@ -482,11 +564,15 @@ esp_err_t dap_config_set_led_brightness(uint8_t pct) {
         err = nvs_commit(h);
     }
     nvs_close(h);
+    cfg_unlock();
     return err;
 }
 
 uint8_t dap_config_get_led_brightness(void) {
-    return s_led_pct;
+    cfg_lock();
+    uint8_t pct = s_led_pct;
+    cfg_unlock();
+    return pct;
 }
 
 /* ------------------------------------------------------------------ */
@@ -542,15 +628,20 @@ static esp_err_t ap_pass_save(void) {
 }
 
 const char *dap_config_get_ap_password(void) {
+    cfg_lock();
     if (s_ap_pass[0] == '\0') {
         /* 理论上 init 里已经生成过;这里兜底,防止有人绕过 init 直接调 */
         ap_pass_generate();
         ap_pass_save();
     }
+    cfg_unlock();
+    /* 返回内部缓冲指针是既有 API(调用方都是立刻拷走);REGEN 与读取
+     * 实际都由 cmd_task 串行发起,不存在并发改写同一缓冲的窗口。 */
     return s_ap_pass;
 }
 
 const char *dap_config_regen_ap_password(void) {
+    cfg_lock();
     ap_pass_generate();
     esp_err_t err = ap_pass_save();
     if (err != ESP_OK) {
@@ -561,5 +652,6 @@ const char *dap_config_regen_ap_password(void) {
     } else {
         ESP_LOGI(TAG, "AP password regenerated and saved");
     }
+    cfg_unlock();
     return s_ap_pass;
 }
