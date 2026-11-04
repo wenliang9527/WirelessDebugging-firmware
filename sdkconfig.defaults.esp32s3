@@ -60,3 +60,13 @@ CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
 CONFIG_ESP_CONSOLE_UART_DEFAULT=n
 CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
 CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
+
+# --- Offline flashing (0.9.0): custom partition table ------------------------
+# 16MB layout, see partitions.csv at the repo root:
+#   nvs/phy_init keep their singleapp offsets (upgrade keeps credentials),
+#   factory 1.5MB, otadata + ota_0/ota_1 (1.5MB each, reserved for the
+#   future OTA line), storage 11MB for flash images (LittleFS).
+# S3-only on purpose: the esp8266/c3 variants have far less flash and keep
+# their stock single-app tables.
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"

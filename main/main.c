@@ -21,6 +21,7 @@
 #include "main/dap_version.h"
 #include "main/dap_cmd.h"
 #include "main/dap_config.h"
+#include "main/dap_store.h"
 
 #include "components/corsacOTA/src/corsacOTA.h"
 
@@ -121,6 +122,10 @@ void app_main() {
 
     // 配置层必须先起来:@STATUS/@SCAN/@LIST 等命令都依赖它读列表与模式偏好
     dap_config_init();
+
+    // 离线烧录存储层:挂 storage 分区(LittleFS)。失败只降级不炸启动,
+    // 主功能(无线调试)不受影响,命令层会报"存储未挂载"。
+    dap_store_init();
 
 #if (USE_UART_BRIDGE == 1)
     uart_bridge_init();

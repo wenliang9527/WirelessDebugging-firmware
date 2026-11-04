@@ -1,0 +1,20 @@
+# Name,   Type, SubType,  Offset,   Size,     Flags
+# Offline-flashing layout for YD-ESP32-S3 (ESP32-S3-WROOM-1-N16R8, 16MB flash).
+#
+# Upgrade-safe by design (0.8.1 -> 0.9.0 reflash keeps NVS intact):
+#   nvs / phy_init keep the exact offsets of partitions_singleapp.csv
+#   (0x9000/0x6000 and 0xF000/0x1000), so WiFi credentials and dap_config
+#   entries survive the partition-table reflash. Everything the old table
+#   had ends at 0x110000; all additions live above that line.
+#
+#   factory   1.5MB  app (was 1MB; headroom for dap_offline + LittleFS)
+#   otadata   8KB    OTA selection slot (fresh 0xFF -> boots factory)
+#   ota_0/1   1.5MB  each, reserved for the future OTA line (C3); unused now
+#   storage   11MB   offline flash-image store (LittleFS), ends exactly at 16MB
+nvs,      data, nvs,     0x9000,   0x6000,
+phy_init, data, phy,     0xF000,   0x1000,
+factory,  app,  factory, 0x10000,  0x180000,
+otadata,  data, ota,     0x190000, 0x2000,
+ota_0,    app,  ota_0,   0x200000, 0x180000,
+ota_1,    app,  ota_1,   0x380000, 0x180000,
+storage,  data, spiffs,  0x500000, 0xB00000,

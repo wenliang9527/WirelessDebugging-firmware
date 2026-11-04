@@ -33,10 +33,20 @@ set PATH=%IDF_PYTHON_ENV%;D:\Espressif\tools\idf-git\2.34.2\cmd;D:\Espressif\too
 
 cd /d "%~dp0"
 
-REM --- Trap 5: make sure the submodule is present -----------------------------
+REM --- Trap 5: make sure the submodules are present ---------------------------
+REM esp_littlefs nests littlefs as a submodule of its own -> recursive
 if not exist "components\corsacOTA\src\corsacOTA.c" (
     echo [build.bat] corsacOTA submodule missing, initializing...
     git submodule update --init components/corsacOTA || goto :fail
+)
+if not exist "components\esp_littlefs\src\littlefs\lfs.h" (
+    echo [build.bat] esp_littlefs/littlefs submodule missing, initializing...
+    git submodule update --init --recursive components/esp_littlefs || goto :fail
+    REM esp_littlefs CMakeLists uses file(GLOB) over src/littlefs/*.c; if the
+   REM tree was configured before the submodule existed, the cached glob is
+   REM empty and the link fails with "undefined reference to lfs_*".
+    REM Dropping build/ forces a fresh configure. (Hit this on 2026-11-04.)
+    if exist build rmdir /s /q build
 )
 
 REM --- Preflight checks -------------------------------------------------------
@@ -101,7 +111,7 @@ echo [build.bat]   partition:  build\partition_table\partition-table.bin
 echo.
 echo [build.bat] To flash (hold BOOT, tap RST to enter download mode; after
 echo [build.bat] flashing release BOOT and tap RST again):
-echo [build.bat]   "%IDF_PYTHON%" "%IDF_PATH%\components\esptool_py\esptool\esptool.py" --chip esp32s3 --port COM18 --baud 921600 write_flash --flash_mode dio --flash_size 16MB --flash_freq 80m 0x0 build\bootloader\bootloader.bin 0x8000 build\partition_table\partition-table.bin 0x10000 build\wireless_esp_dap.bin
+echo [build.bat]   "%IDF_PYTHON%" "%IDF_PATH%\components\esptool_py\esptool\esptool.py" --chip esp32s3 --port COM18 --baud 921600 write_flash --flash_mode dio --flash_size 16MB --flash_freq 80m 0x0 build\bootloader\bootloader.bin 0x8000 build\partition_table\partition-table.bin 0x10000 build\wireless_esp_dap.bin 0x190000 build\ota_data_initial.bin
 exit /b 0
 
 :fail
