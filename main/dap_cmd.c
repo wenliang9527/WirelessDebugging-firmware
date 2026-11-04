@@ -965,7 +965,9 @@ static void cmd_fprog(const char *args) {
         dap_cmd_data("state=%s slot=%d pct=%d idcode=%08x",
                      state, st.slot, st.pct, st.idcode);
     }
-    dap_cmd_ok(NULL);
+    /* 终结帧带首词:PC 侧 dap_proto._looks_like_reply_to 靠 @OK 首词做
+     * "迟到应答"判别,裸 @OK(空 body)匹配不到任何首词会被整条丢弃。 */
+    dap_cmd_ok("prog");
 }
 
 /* ------------------------------------------------------------------ */
