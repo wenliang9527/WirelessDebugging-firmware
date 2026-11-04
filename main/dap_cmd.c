@@ -799,6 +799,7 @@ static void cmd_fput(const char *args) {
     }
 
     char sub[8] = {0};
+    const char *rest = args;   /* 子命令之后的参数部分 */
     {
         size_t i = 0;
         while (args[i] && !isspace((unsigned char)args[i]) && i < sizeof(sub) - 1) {
@@ -806,24 +807,32 @@ static void cmd_fput(const char *args) {
             i++;
         }
         sub[i] = '\0';
+        rest = args + i;
+        while (*rest && isspace((unsigned char)*rest)) {
+            rest++;
+        }
     }
+    /* 注意:kv 解析必须喂 rest 而不是整串 args。param_get 按 '&' 分段后
+     * 要求段以 "key=" 开头,整串的第一段是 "begin slot=0",slot= 永远
+     * 匹配不上 —— 真机首跑(2026-11-04)就这么炸的:所有 begin 都报
+     * need slot_and_name,而 mock 因为先剥了子命令而全绿。 */
 
     if (strcmp(sub, "begin") == 0) {
         dap_store_meta_t m = {0};
         char v[DAP_STORE_NAME_LEN * 3] = {0};
         int slot;
         uint32_t size = 0, crc = 0;
-        if (!slot_arg(args, &slot) ||
-            !param_get(args, "name", v, sizeof(v)) || v[0] == '\0' ||
+        if (!slot_arg(rest, &slot) ||
+            !param_get(rest, "name", v, sizeof(v)) || v[0] == '\0' ||
             strlen(v) >= DAP_STORE_NAME_LEN) {
             dap_cmd_err(DAP_ERR_BADARG, "need slot_and_name");
             return;
         }
         strlcpy(m.name, v, sizeof(m.name));
-        if (param_get(args, "size", v, sizeof(v)))  size = (uint32_t)strtoul(v, NULL, 10);
-        if (param_get(args, "crc", v, sizeof(v)))   crc  = (uint32_t)strtoul(v, NULL, 16);
-        if (param_get(args, "family", v, sizeof(v))) strlcpy(m.family, v, sizeof(m.family));
-        if (param_get(args, "addr", v, sizeof(v)))  m.addr = (uint32_t)strtoul(v, NULL, 0);
+        if (param_get(rest, "size", v, sizeof(v)))  size = (uint32_t)strtoul(v, NULL, 10);
+        if (param_get(rest, "crc", v, sizeof(v)))   crc  = (uint32_t)strtoul(v, NULL, 16);
+        if (param_get(rest, "family", v, sizeof(v))) strlcpy(m.family, v, sizeof(m.family));
+        if (param_get(rest, "addr", v, sizeof(v)))  m.addr = (uint32_t)strtoul(v, NULL, 0);
         if (size == 0 || crc == 0 || m.family[0] == '\0') {
             dap_cmd_err(DAP_ERR_BADARG, "need size crc family");
             return;
