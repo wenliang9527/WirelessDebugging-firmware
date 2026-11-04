@@ -16,7 +16,7 @@
  *   @PING @STATUS @SCAN @CONNECT @LIST @DEL @PRIO @PIN @MODE @LED
  *   @FACTORY @REBOOT
  * 离线烧录(2026-11,第二阶段):
- *   @FLIST @FSTAT @FDEL @FSEL @FNAME @FPUT(@FLASH/@FPROG 随烧录引擎上线)
+ *   @FLIST @FSTAT @FDEL @FSEL @FNAME @FPUT @FLASH @FPROG
  *
  * 并发:
  *   单任务串行处理。命令处理函数尽量短;耗时操作(如 @CONNECT 扫描)由
@@ -36,6 +36,7 @@
 #include "main/dap_config.h"
 #include "main/dap_led.h"
 #include "main/dap_store.h"
+#include "main/dap_offline.h"
 #include "main/dap_version.h"
 #include "main/wifi_configuration.h"
 #include "main/wifi_handle.h"
@@ -903,6 +904,70 @@ static void cmd_fput(const char *args) {
     dap_cmd_err(DAP_ERR_BADARG, "usage: @FPUT begin|data|end|abort ...");
 }
 
+/*
+ * @FLASH [slot=N] — 触发离线烧录(后台执行,进度看 @FPROG)。
+ * 缺省 slot = 当前镜像。烧录期间再次触发 / 在线调试占线 → @ERR。
+ */
+static void cmd_flash(const char *args) {
+    int slot = -1;
+    char v[8] = {0};
+    if (args && param_get(args, "slot", v, sizeof(v))) {
+        slot = atoi(v);
+        if (slot < 0 || slot >= DAP_STORE_MAX_SLOT) {
+            dap_cmd_err(DAP_ERR_BADARG, "slot_out_of_range");
+            return;
+        }
+    } else {
+        slot = dap_store_current();
+        if (slot < 0) {
+            dap_cmd_err(DAP_ERR_SLOT_EMPTY, "no_current_image");
+            return;
+        }
+    }
+    if (!dap_store_mounted()) {
+        dap_cmd_err(DAP_ERR_NOSTORE, "storage_not_mounted");
+        return;
+    }
+    dap_store_meta_t m;
+    if (!dap_store_get(slot, &m)) {
+        dap_cmd_err(DAP_ERR_SLOT_EMPTY, "slot_empty");
+        return;
+    }
+
+    char reason[48] = {0};
+    if (!dap_offline_start(slot, reason)) {
+        /* 引擎侧已给出蛇形原因,映射到对应错误码 */
+        if (strcmp(reason, "flash_in_progress") == 0) {
+            dap_cmd_err(DAP_ERR_BUSY, reason);
+        } else if (strcmp(reason, "slot_empty") == 0) {
+            dap_cmd_err(DAP_ERR_SLOT_EMPTY, reason);
+        } else if (strcmp(reason, "storage_not_mounted") == 0) {
+            dap_cmd_err(DAP_ERR_NOSTORE, reason);
+        } else {
+            dap_cmd_err(DAP_ERR_INTERNAL, reason[0] ? reason : "start_failed");
+        }
+        return;
+    }
+    dap_cmd_ok("started slot=%d name=%s size=%u", slot, m.name, (unsigned)m.size);
+}
+
+/** @FPROG — 烧录进度/最近结果(GUI 500ms 轮询) */
+static void cmd_fprog(const char *args) {
+    dap_off_status_t st;
+    dap_offline_get_status(&st);
+    static const char *names[] = {"idle", "running", "done", "fail"};
+    const char *state =
+        st.state <= DAP_OFF_FAIL ? names[st.state] : "unknown";
+    if (st.state == DAP_OFF_FAIL) {
+        dap_cmd_data("state=%s slot=%d pct=%d idcode=%08x err=%d msg=%s",
+                     state, st.slot, st.pct, st.idcode, st.err, st.msg);
+    } else {
+        dap_cmd_data("state=%s slot=%d pct=%d idcode=%08x",
+                     state, st.slot, st.pct, st.idcode);
+    }
+    dap_cmd_ok(NULL);
+}
+
 /* ------------------------------------------------------------------ */
 /* 分发                                                                */
 /* ------------------------------------------------------------------ */
@@ -932,6 +997,8 @@ static const cmd_entry_t s_cmds[] = {
     { "FSEL",    cmd_fsel    },
     { "FNAME",   cmd_fname   },
     { "FPUT",    cmd_fput    },
+    { "FLASH",   cmd_flash   },
+    { "FPROG",   cmd_fprog   },
 };
 
 static void dispatch_line(char *line) {

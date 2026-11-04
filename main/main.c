@@ -23,6 +23,7 @@
 #include "main/dap_config.h"
 #include "main/dap_store.h"
 #include "main/dap_upload.h"
+#include "main/dap_offline.h"
 
 #include "components/corsacOTA/src/corsacOTA.h"
 
@@ -127,6 +128,10 @@ void app_main() {
     // 离线烧录存储层:挂 storage 分区(LittleFS)。失败只降级不炸启动,
     // 主功能(无线调试)不受影响,命令层会报"存储未挂载"。
     dap_store_init();
+
+    // 离线烧录线锁:必须在 DAP 数据面任务(tcp_server/DAP_Thread)起
+    // 来之前创建——它们逐命令持这把锁,与离线烧录会话互斥。
+    dap_offline_init();
 
 #if (USE_UART_BRIDGE == 1)
     uart_bridge_init();

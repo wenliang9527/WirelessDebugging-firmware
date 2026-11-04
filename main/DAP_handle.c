@@ -17,6 +17,7 @@
 #include "main/usbip_server.h"
 #include "main/DAP_handle.h"
 #include "main/dap_configuration.h"
+#include "main/dap_offline.h"
 #include "main/wifi_configuration.h"
 
 #include "components/USBIP/usb_descriptor.h"
@@ -225,7 +226,12 @@ void DAP_Thread(void *argument)
                 item->buf[0] = ID_DAP_ExecuteCommands;
             }
 
+            /* 线锁(与离线烧录互斥):烧录会话整体持锁,这里逐命令持锁,
+             * 烧录期间命令在锁上排队——会话不散,只是停摆几秒,烧完自恢复。 */
+            SemaphoreHandle_t wire = dap_offline_wire_lock();
+            if (wire) xSemaphoreTake(wire, portMAX_DELAY);
             resLength = DAP_ProcessCommand((uint8_t *)item->buf, (uint8_t *)DAPDataProcessed.buf); // use first 4 byte to save length
+            if (wire) xSemaphoreGive(wire);
             resLength &= 0xFFFF;                                                                   // res length in lower 16 bits
 
             vRingbufferReturnItem(dap_dataIN_handle, (void *)item); // process done.

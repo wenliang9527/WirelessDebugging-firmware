@@ -38,6 +38,8 @@
 #include "esp_partition.h"
 #include "esp_system.h"
 
+#include "main/dap_offline.h"
+
 #include "lwip/err.h"
 #include "lwip/sockets.h"
 #include "lwip/sys.h"
@@ -901,7 +903,11 @@ static void co_websocket_process_dap(uint8_t *data, size_t len) {
     max_offset = co_websocket_get_res_payload_offset(1500);
     buf = ws_process_buffer + max_offset;
 
+    /* 线锁(与离线烧录互斥),同 DAP_handle 的 DAP_ProcessCommand 包裹 */
+    SemaphoreHandle_t wire = dap_offline_wire_lock();
+    if (wire) xSemaphoreTake(wire, portMAX_DELAY);
     res = DAP_ExecuteCommand(data, buf);
+    if (wire) xSemaphoreGive(wire);
     res &= 0xFFFF;
 
     offset = co_websocket_get_res_payload_offset(res);
