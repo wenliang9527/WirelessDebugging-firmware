@@ -2,7 +2,7 @@ set(COMPONENT_ADD_INCLUDEDIRS "${PROJECT_PATH}")
 set(COMPONENT_SRCS
     main.c timer.c tcp_server.c usbip_server.c DAP_handle.c
     uart_bridge.c wifi_handle.c dap_cmd.c dap_config.c dap_led.c
-    dap_store.c)
+    dap_store.c dap_upload.c)
 
 # WS2812 状态灯用 led_strip 组件(已复制到 <project>/components/led_strip)。
 # 这里【不】设置 COMPONENT_REQUIRES —— 本项目是 register_component() 老风格,

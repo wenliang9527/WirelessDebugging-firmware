@@ -22,6 +22,7 @@
 #include "main/dap_cmd.h"
 #include "main/dap_config.h"
 #include "main/dap_store.h"
+#include "main/dap_upload.h"
 
 #include "components/corsacOTA/src/corsacOTA.h"
 
@@ -192,4 +193,8 @@ void app_main() {
 #if (USE_UART_BRIDGE == 1)
     xTaskCreate(uart_bridge_task, "uart_server", UART_BRIDGE_TASK_STACK_SIZE, NULL, 2, NULL);
 #endif
+
+    // 离线烧录:WiFi 镜像上传服务(TCP:1235)。socket 由任务内部建,
+    // 没联网时 listen 挂着也没人能连上,不需要等 WiFi 就绪。
+    dap_upload_init();
 }
