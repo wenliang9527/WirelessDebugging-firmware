@@ -33,6 +33,14 @@ typedef enum {
  */
 esp_err_t dap_led_init(void);
 
+/* --- 离线烧录反馈(临时覆盖层,压在 WiFi 基态上) ---
+ * active:紫慢闪,引擎结束时会调 done/fail 换掉
+ * done:  绿常亮 ~3s 后自动回落 WiFi 基态
+ * fail:  红快闪 ~15s 后自动回落 */
+void dap_led_flash_active(void);
+void dap_led_flash_done(void);
+void dap_led_flash_fail(void);
+
 /** 切换状态(线程安全,可在事件回调里调用) */
 void dap_led_set(dap_led_state_t state);
 

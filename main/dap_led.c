@@ -44,6 +44,19 @@ static led_strip_t *s_strip = NULL;
 static volatile dap_led_state_t s_state = DAP_LED_BOOT;
 static volatile bool s_run = false;
 
+/* 离线烧录反馈(D5):临时覆盖层,压在 WiFi 基态之上。
+ * active=烧录中紫慢闪(无期限,引擎结束时会换 done/fail);
+ * done=绿常亮 ~3s、fail=红快闪 ~15s,到期自动回落基态——
+ * 回落目标由 WiFi 事件维护的 s_state 承担,引擎不需要知道网络态。 */
+typedef enum {
+    LED_OV_NONE = 0,
+    LED_OV_FLASHING,
+    LED_OV_DONE,
+    LED_OV_FAIL,
+} led_override_t;
+static volatile led_override_t s_ov = LED_OV_NONE;
+static volatile uint32_t s_ov_ticks_left = 0;
+
 /** 按当前亮度百分比缩放单通道 */
 static inline uint32_t scale(uint32_t v)
 {
@@ -107,6 +120,29 @@ static void led_task(void *arg)
     uint32_t tick = 0;
     while (s_run) {
         dap_led_state_t st = s_state;
+
+        /* 覆盖层优先渲染;带时限的两种到期自动回落 */
+        led_override_t ov = s_ov;
+        if (ov != LED_OV_NONE) {
+            switch (ov) {
+            case LED_OV_FLASHING: /* 紫慢闪:1.2s 周期,同"连接中"节奏但颜色区分 */
+                led_write_level(180, 0, 255, (tick % 20) < 8 ? 100 : 0);
+                break;
+            case LED_OV_DONE: /* 绿常亮 3s:一锤定音的成功 */
+                led_write_level(0, 255, 60, 100);
+                if (s_ov_ticks_left > 0 && --s_ov_ticks_left == 0) s_ov = LED_OV_NONE;
+                break;
+            case LED_OV_FAIL: /* 红快闪 15s:与 FAULT 同款急促,但会自己退场 */
+                led_write_level(255, 0, 0, (tick % 6) < 3 ? 100 : 0);
+                if (s_ov_ticks_left > 0 && --s_ov_ticks_left == 0) s_ov = LED_OV_NONE;
+                break;
+            default:
+                break;
+            }
+            tick++;
+            vTaskDelay(pdMS_TO_TICKS(LED_TICK_MS));
+            continue;
+        }
 
         switch (st) {
         case DAP_LED_BOOT:
@@ -224,6 +260,28 @@ bool dap_led_available(void)
     return s_strip != NULL;
 }
 
+/* --- 离线烧录反馈(覆盖层入口,线程安全:只写两个 volatile) --- */
+
+void dap_led_flash_active(void)
+{
+    s_ov_ticks_left = 0;
+    s_ov = LED_OV_FLASHING;
+}
+
+void dap_led_flash_done(void)
+{
+    /* 3000ms / 60ms 拍 = 50 拍 */
+    s_ov_ticks_left = 3000 / LED_TICK_MS;
+    s_ov = LED_OV_DONE;
+}
+
+void dap_led_flash_fail(void)
+{
+    /* 15s,长于 done:失败更需要人注意到 */
+    s_ov_ticks_left = 15000 / LED_TICK_MS;
+    s_ov = LED_OV_FAIL;
+}
+
 #else  /* 非 S3:保持空实现,不影响其他目标编译 */
 
 esp_err_t dap_led_init(void) { return ESP_ERR_NOT_SUPPORTED; }
@@ -232,5 +290,8 @@ void dap_led_off(void) { }
 bool dap_led_available(void) { return false; }
 void dap_led_set_brightness(uint8_t pct) { (void)pct; }
 uint8_t dap_led_get_brightness(void) { return 0; }
+void dap_led_flash_active(void) { }
+void dap_led_flash_done(void) { }
+void dap_led_flash_fail(void) { }
 
 #endif

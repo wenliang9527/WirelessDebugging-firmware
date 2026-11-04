@@ -16,6 +16,7 @@
 #include <string.h>
 
 #include "esp_log.h"
+#include "driver/gpio.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -27,6 +28,7 @@
 
 #include "main/dap_cmd.h"
 #include "main/dap_flash_algo.h"
+#include "main/dap_led.h"
 #include "main/dap_offline.h"
 #include "main/dap_store.h"
 
@@ -37,14 +39,25 @@ static const char *TAG = "dap.offline";
 #define WIRE_LOCK_TIMEOUT_MS 3000   /* 在线调试占线时的让位时限 */
 #define FILE_CHUNK 1024
 
+/* 板上按键(BOOT 键 = GPIO0)长按触发离线烧录。
+ * GPIO0 是 strap 脚,但下载模式只在**复位释放瞬间**采样;运行期它就是
+ * 普通输入,长按只会走到这里的轮询,不会把板子按进下载模式。 */
+#define BTN_GPIO     0
+#define BTN_POLL_MS  20
+#define BTN_HOLD_MS  2000
+
 static SemaphoreHandle_t s_wire_lock;
 static dap_off_status_t  s_st;      /* 单写入者(引擎任务),state 最后写 */
 static uint8_t s_chunk[FILE_CHUNK];
+
+static void button_task(void *arg);  /* 定义在引擎主体之后 */
 
 void dap_offline_init(void) {
     if (!s_wire_lock) {
         s_wire_lock = xSemaphoreCreateMutex();
     }
+    /* 按键轮询任务:20ms 一拍,栈 2048 足够(gpio_get_level 很浅) */
+    xTaskCreate(button_task, "dap_btn", 2048, NULL, 2, NULL);
 }
 
 SemaphoreHandle_t dap_offline_wire_lock(void) {
@@ -80,8 +93,46 @@ static void fail(int err, const char *msg) {
     strlcpy(s_st.msg, msg, sizeof(s_st.msg));
     s_st.err = err;
     s_st.state = DAP_OFF_FAIL;   /* state 最后写:读侧看到 FAIL 时字段已齐 */
+    dap_led_flash_fail();        /* 红快闪 ~15s 自动回落 WiFi 基态 */
     ESP_LOGW(TAG, "flash fail: %s (err=%d idcode=%08x)",
              msg, err, s_st.idcode);
+}
+
+/* ---------------- 板上按键(GPIO0 长按 ≥2s → 烧当前镜像) ---------------- */
+
+static void button_task(void *arg) {
+    gpio_config_t io = {
+        .pin_bit_mask = 1ULL << BTN_GPIO,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&io);
+
+    int low_ms = 0;
+    bool latched = false;   /* 触发过一次就锁死,松开才能再按 */
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(BTN_POLL_MS));
+        if (gpio_get_level(BTN_GPIO) == 0) {
+            if (!latched) {
+                low_ms += BTN_POLL_MS;
+                if (low_ms >= BTN_HOLD_MS) {
+                    latched = true;   /* 先锁再触发,防止按住不放连环起任务 */
+                    int slot = dap_store_current();
+                    char reason[48] = {0};
+                    if (dap_offline_start(slot, reason)) {
+                        ESP_LOGI(TAG, "button: flash started (slot=%d)", slot);
+                    } else {
+                        ESP_LOGW(TAG, "button: refused (%s)", reason);
+                    }
+                }
+            }
+        } else {
+            low_ms = 0;
+            latched = false;
+        }
+    }
 }
 
 /* ---------------- 引擎主体(引擎任务上下文) ---------------- */
@@ -99,6 +150,7 @@ static void offline_flash_task(void *arg) {
     s_st.idcode = 0;
     s_st.err = 0;
     s_st.msg[0] = '\0';
+    dap_led_flash_active();       /* 紫慢闪,结束换 done(绿)/fail(红) */
 
     if (!dap_store_get(slot, &m)) {
         fail(DAP_ERR_SLOT_EMPTY, "slot_empty");
@@ -242,6 +294,7 @@ static void offline_flash_task(void *arg) {
     s_st.err = 0;
     strlcpy(s_st.msg, "ok", sizeof(s_st.msg));
     s_st.state = DAP_OFF_DONE;
+    dap_led_flash_done();         /* 绿常亮 ~3s 自动回落 WiFi 基态 */
     ESP_LOGI(TAG, "flash done: slot=%d %u bytes -> %08x",
              slot, (unsigned)m.size, m.addr);
 
