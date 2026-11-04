@@ -18,6 +18,12 @@
  *           加递归互斥(此前被 cmd_task 与 WiFi 事件回调无锁并发读写);
  *           DAP_Thread 栈 2048 -> 4096(uart_server 同款风险,预防性)。
  *           命令集与 NVS 布局不变,工具版本门槛仍 0.6。
+ *   - 0.9.0  离线烧录(第二阶段):16MB 自定义分区表(nvs 保位升级)、
+ *           LittleFS 镜像存储(8 槽位)、@FLIST/@FSTAT/@FDEL/@FSEL/
+ *           @FNAME/@FPUT/@FLASH/@FPROG、TCP:1235 上传、板上 SWD 烧录
+ *           引擎(PY32 家族,flash loader 走 RAM blob)、GPIO0 长按触发、
+ *           LED 三态反馈。**升级需连分区表一起重烧**(nvs/phy 保位,
+ *           配置不丢)。工具的离线功能门槛 = 0.9。
  *
  * 0.7.1 与 0.7.2 是同一天连着改的两处启动流程缺陷,没有单独出过 0.7.1
  * 的包 —— 现场能拿到的第一个同时含两处修复的版本就是 0.7.2。
@@ -32,8 +38,8 @@
 #define __DAP_VERSION__
 
 #define DAP_FW_VERSION_MAJOR 0
-#define DAP_FW_VERSION_MINOR 8
-#define DAP_FW_VERSION_PATCH 1
+#define DAP_FW_VERSION_MINOR 9
+#define DAP_FW_VERSION_PATCH 0
 
 #define DAP_STR_(x) #x
 #define DAP_STR(x) DAP_STR_(x)
