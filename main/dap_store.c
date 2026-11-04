@@ -193,6 +193,9 @@ esp_err_t dap_store_begin(int slot, const dap_store_meta_t *meta) {
         meta->size == 0 || meta->name[0] == '\0') {
         return ESP_ERR_INVALID_ARG;
     }
+    /* 互斥锁从 begin 持到 finish/abort;若上一会话还占着(TCP 与 USB 兜底
+     * 抢用、或上次异常中断没走到收尾),直接拒绝而不是死等。 */
+    if (s_up.active) return ESP_ERR_INVALID_STATE;
     xSemaphoreTake(s_lock, portMAX_DELAY);
 
     char tmp[24];
@@ -270,6 +273,24 @@ void dap_store_abort(void) {
     unlink(tmp);
     s_up.active = false;
     xSemaphoreGive(s_lock);
+}
+
+esp_err_t dap_store_rename(int slot, const char *name) {
+    if (!s_mounted) return ESP_ERR_INVALID_STATE;
+    if (slot < 0 || slot >= DAP_STORE_MAX_SLOT || !name || !name[0]) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) return ESP_FAIL;
+    dap_store_meta_t m;
+    if (!nvs_read_meta(h, slot, &m)) {
+        nvs_close(h);
+        return ESP_ERR_NOT_FOUND;
+    }
+    strlcpy(m.name, name, sizeof(m.name));
+    esp_err_t err = nvs_write_meta(h, slot, &m);
+    nvs_close(h);
+    return err;
 }
 
 esp_err_t dap_store_del(int slot) {

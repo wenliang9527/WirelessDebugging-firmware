@@ -28,6 +28,12 @@ enum {
     DAP_ERR_NO_AP_FOUND   = 201,
     DAP_ERR_AUTH_FAIL     = 202,
     DAP_ERR_HANDSHAKE     = 204,
+    /* 离线烧录(第二阶段,430 段集中给镜像存储与烧录引擎) */
+    DAP_ERR_NOSTORE       = 430,  /* storage 分区未挂载(离线烧录整体不可用) */
+    DAP_ERR_SLOT_EMPTY    = 431,  /* 槽位为空(无此镜像) */
+    DAP_ERR_CRC           = 432,  /* CRC 校验不符 */
+    DAP_ERR_FAMILY        = 433,  /* 烧录算法家族不支持 */
+    DAP_ERR_TARGET        = 434,  /* SWD 连不上目标 */
 };
 
 /** 运行模式 */

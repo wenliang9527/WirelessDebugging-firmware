@@ -15,6 +15,8 @@
  * 命令一览(2026-10):
  *   @PING @STATUS @SCAN @CONNECT @LIST @DEL @PRIO @PIN @MODE @LED
  *   @FACTORY @REBOOT
+ * 离线烧录(2026-11,第二阶段):
+ *   @FLIST @FSTAT @FDEL @FSEL @FNAME @FPUT(@FLASH/@FPROG 随烧录引擎上线)
  *
  * 并发:
  *   单任务串行处理。命令处理函数尽量短;耗时操作(如 @CONNECT 扫描)由
@@ -33,6 +35,7 @@
 #include "main/dap_cmd.h"
 #include "main/dap_config.h"
 #include "main/dap_led.h"
+#include "main/dap_store.h"
 #include "main/dap_version.h"
 #include "main/wifi_configuration.h"
 #include "main/wifi_handle.h"
@@ -623,6 +626,284 @@ static void cmd_ap(const char *args) {
 }
 
 /* ------------------------------------------------------------------ */
+/* 离线烧录:镜像文件命令(第二阶段 D2)                                 */
+/*                                                                     */
+/* 镜像存 storage 分区(dap_store),索引在 NVS。命令面只做管理与      */
+/* USB 兜底上传;烧录触发(@FLASH/@FPROG)随 D4 引擎上线。             */
+/* ------------------------------------------------------------------ */
+
+/** URL 编码到 dst(与 param_get 的解码互逆,name 里的空格/中文/&/= 都安全) */
+static void url_encode_to(char *dst, size_t dstn, const char *src) {
+    size_t o = 0;
+    for (const unsigned char *p = (const unsigned char *)src; *p && o + 4 <= dstn; p++) {
+        unsigned char c = *p;
+        if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
+            dst[o++] = (char)c;
+        } else {
+            o += (size_t)snprintf(dst + o, dstn - o, "%%%02X", c);
+        }
+    }
+    dst[o] = '\0';
+}
+
+/** 元数据一行 @DATA(name 走 URL 编码,PC 侧解码) */
+static void fmeta_row(int slot, const dap_store_meta_t *m) {
+    char enc[DAP_STORE_NAME_LEN * 3];
+    url_encode_to(enc, sizeof(enc), m->name);
+    dap_cmd_data("slot=%d name=%s size=%u crc=%08" PRIX32 " family=%s"
+                 " addr=0x%08" PRIX32 " seq=%u cur=%d",
+                 slot, enc, (unsigned)m->size, m->crc32, m->family,
+                 m->addr, (unsigned)m->seq, slot == dap_store_current());
+}
+
+/** 取 slot=N 参数并做范围检查 */
+static bool slot_arg(const char *args, int *out) {
+    char v[8] = {0};
+    if (!args || !param_get(args, "slot", v, sizeof(v))) return false;
+    int n = atoi(v);
+    if (n < 0 || n >= DAP_STORE_MAX_SLOT) return false;
+    *out = n;
+    return true;
+}
+
+/** @FLIST — 列出全部镜像(每槽一行 @DATA,再一行 @OK 汇总) */
+static void cmd_flist(const char *args) {
+    if (!dap_store_mounted()) {
+        dap_cmd_err(DAP_ERR_NOSTORE, "storage_not_mounted");
+        return;
+    }
+    int n = 0;
+    for (int i = 0; i < DAP_STORE_MAX_SLOT; i++) {
+        dap_store_meta_t m;
+        if (dap_store_get(i, &m)) {
+            fmeta_row(i, &m);
+            n++;
+        }
+    }
+    dap_cmd_ok("files=%d cur=%d", n, dap_store_current());
+}
+
+/** @FSTAT slot=N — 单槽详情 */
+static void cmd_fstat(const char *args) {
+    if (!dap_store_mounted()) {
+        dap_cmd_err(DAP_ERR_NOSTORE, "storage_not_mounted");
+        return;
+    }
+    int slot;
+    if (!slot_arg(args, &slot)) {
+        dap_cmd_err(DAP_ERR_BADARG, "usage: @FSTAT slot=N");
+        return;
+    }
+    dap_store_meta_t m;
+    if (!dap_store_get(slot, &m)) {
+        dap_cmd_err(DAP_ERR_SLOT_EMPTY, "slot_empty");
+        return;
+    }
+    fmeta_row(slot, &m);
+    dap_cmd_ok("slot=%d", slot);
+}
+
+/** @FDEL slot=N — 删除镜像(删的是当前槽时由存储层自动回落) */
+static void cmd_fdel(const char *args) {
+    if (!dap_store_mounted()) {
+        dap_cmd_err(DAP_ERR_NOSTORE, "storage_not_mounted");
+        return;
+    }
+    int slot;
+    if (!slot_arg(args, &slot)) {
+        dap_cmd_err(DAP_ERR_BADARG, "usage: @FDEL slot=N");
+        return;
+    }
+    esp_err_t err = dap_store_del(slot);
+    if (err == ESP_ERR_NOT_FOUND) {
+        dap_cmd_err(DAP_ERR_SLOT_EMPTY, "slot_empty");
+        return;
+    }
+    if (err != ESP_OK) {
+        dap_cmd_err(DAP_ERR_INTERNAL, "del_failed");
+        return;
+    }
+    dap_cmd_ok("deleted slot=%d cur=%d", slot, dap_store_current());
+}
+
+/** @FSEL slot=N — 设为当前烧录文件 */
+static void cmd_fsel(const char *args) {
+    if (!dap_store_mounted()) {
+        dap_cmd_err(DAP_ERR_NOSTORE, "storage_not_mounted");
+        return;
+    }
+    int slot;
+    if (!slot_arg(args, &slot)) {
+        dap_cmd_err(DAP_ERR_BADARG, "usage: @FSEL slot=N");
+        return;
+    }
+    esp_err_t err = dap_store_set_current(slot);
+    if (err == ESP_ERR_NOT_FOUND) {
+        dap_cmd_err(DAP_ERR_SLOT_EMPTY, "slot_empty");
+        return;
+    }
+    if (err != ESP_OK) {
+        dap_cmd_err(DAP_ERR_INTERNAL, "sel_failed");
+        return;
+    }
+    dap_cmd_ok("current slot=%d", slot);
+}
+
+/** @FNAME slot=N name=<enc> — 改显示名 */
+static void cmd_fname(const char *args) {
+    if (!dap_store_mounted()) {
+        dap_cmd_err(DAP_ERR_NOSTORE, "storage_not_mounted");
+        return;
+    }
+    int slot;
+    char name[DAP_STORE_NAME_LEN * 3] = {0};
+    if (!slot_arg(args, &slot) || !param_get(args, "name", name, sizeof(name))) {
+        dap_cmd_err(DAP_ERR_BADARG, "usage: @FNAME slot=N name=<enc>");
+        return;
+    }
+    if (name[0] == '\0' || strlen(name) >= DAP_STORE_NAME_LEN) {
+        dap_cmd_err(DAP_ERR_BADARG, "name_empty_or_too_long");
+        return;
+    }
+    if (!dap_store_get(slot, NULL)) {
+        dap_cmd_err(DAP_ERR_SLOT_EMPTY, "slot_empty");
+        return;
+    }
+    if (dap_store_rename(slot, name) != ESP_OK) {
+        dap_cmd_err(DAP_ERR_INTERNAL, "rename_failed");
+        return;
+    }
+    dap_cmd_ok("renamed slot=%d", slot);
+}
+
+/*
+ * @FPUT — USB 兜底上传(无 WiFi 时的小文件通道)。
+ *
+ *   @FPUT begin slot=N name=<enc> size=B crc=XXXXXXXX family=PY32 addr=0x08000000
+ *   @FPUT data <hex...>     (每行 ≤116 字节,受 CMD_LINE_MAX=256 限制)
+ *   @FPUT end               (板端复算 CRC,过了才落 NVS)
+ *   @FPUT abort             (放弃)
+ *
+ * 与 TCP:1235(D3)共用 dap_store 的单会话锁,两边谁先 begin 谁占住,
+ * 后来的 begin 会把前一个未完成的会话作废(异常中断后 PC 重试无需重启板)。
+ */
+static void cmd_fput(const char *args) {
+    if (!dap_store_mounted()) {
+        dap_cmd_err(DAP_ERR_NOSTORE, "storage_not_mounted");
+        return;
+    }
+    if (!args || !*args) {
+        dap_cmd_err(DAP_ERR_BADARG, "usage: @FPUT begin|data|end|abort ...");
+        return;
+    }
+
+    char sub[8] = {0};
+    {
+        size_t i = 0;
+        while (args[i] && !isspace((unsigned char)args[i]) && i < sizeof(sub) - 1) {
+            sub[i] = args[i];
+            i++;
+        }
+        sub[i] = '\0';
+    }
+
+    if (strcmp(sub, "begin") == 0) {
+        dap_store_meta_t m = {0};
+        char v[DAP_STORE_NAME_LEN * 3] = {0};
+        int slot;
+        uint32_t size = 0, crc = 0;
+        if (!slot_arg(args, &slot) ||
+            !param_get(args, "name", v, sizeof(v)) || v[0] == '\0' ||
+            strlen(v) >= DAP_STORE_NAME_LEN) {
+            dap_cmd_err(DAP_ERR_BADARG, "need slot_and_name");
+            return;
+        }
+        strlcpy(m.name, v, sizeof(m.name));
+        if (param_get(args, "size", v, sizeof(v)))  size = (uint32_t)strtoul(v, NULL, 10);
+        if (param_get(args, "crc", v, sizeof(v)))   crc  = (uint32_t)strtoul(v, NULL, 16);
+        if (param_get(args, "family", v, sizeof(v))) strlcpy(m.family, v, sizeof(m.family));
+        if (param_get(args, "addr", v, sizeof(v)))  m.addr = (uint32_t)strtoul(v, NULL, 0);
+        if (size == 0 || crc == 0 || m.family[0] == '\0') {
+            dap_cmd_err(DAP_ERR_BADARG, "need size crc family");
+            return;
+        }
+        m.size = size;
+        m.crc32 = crc;
+
+        dap_store_abort(); /* 若有残留会话(上次异常断),作废重来 */
+        esp_err_t err = dap_store_begin(slot, &m);
+        if (err == ESP_ERR_INVALID_ARG) {
+            dap_cmd_err(DAP_ERR_BADARG, "bad_meta_or_slot");
+        } else if (err != ESP_OK) {
+            dap_cmd_err(DAP_ERR_INTERNAL, "begin_failed");
+        } else {
+            dap_cmd_ok("begin slot=%d size=%u", slot, (unsigned)size);
+        }
+        return;
+    }
+
+    if (strcmp(sub, "data") == 0) {
+        const char *hex = args + strlen(sub);
+        while (*hex && isspace((unsigned char)*hex)) hex++;
+        size_t hlen = strlen(hex);
+        if (hlen == 0 || (hlen & 1)) {
+            dap_cmd_err(DAP_ERR_BADARG, "hex_len_must_be_even");
+            return;
+        }
+        if (hlen / 2 > 128) {
+            dap_cmd_err(DAP_ERR_BADARG, "max_128_bytes_per_line");
+            return;
+        }
+        uint8_t buf[128];
+        for (size_t i = 0; i < hlen; i += 2) {
+            int hi = hexval(hex[i]), lo = hexval(hex[i + 1]);
+            if (hi < 0 || lo < 0) {
+                dap_cmd_err(DAP_ERR_BADARG, "bad_hex_char");
+                return;
+            }
+            buf[i / 2] = (uint8_t)((hi << 4) | lo);
+        }
+        esp_err_t err = dap_store_write(buf, hlen / 2);
+        if (err == ESP_ERR_INVALID_STATE) {
+            dap_cmd_err(DAP_ERR_STATE, "no_upload_in_progress");
+        } else if (err == ESP_ERR_INVALID_SIZE) {
+            dap_store_abort(); /* 超长即会话非法,立即作废 */
+            dap_cmd_err(DAP_ERR_BADARG, "size_exceeds_declared");
+        } else if (err != ESP_OK) {
+            dap_store_abort();
+            dap_cmd_err(DAP_ERR_INTERNAL, "write_failed");
+        } else {
+            dap_cmd_ok("written=%u", (unsigned)(hlen / 2));
+        }
+        return;
+    }
+
+    if (strcmp(sub, "end") == 0) {
+        esp_err_t err = dap_store_finish();
+        if (err == ESP_ERR_INVALID_STATE) {
+            dap_cmd_err(DAP_ERR_STATE, "no_upload_in_progress");
+        } else if (err == ESP_ERR_INVALID_SIZE) {
+            dap_cmd_err(DAP_ERR_BADARG, "size_mismatch");
+        } else if (err == ESP_ERR_INVALID_CRC) {
+            dap_cmd_err(DAP_ERR_CRC, "crc_mismatch");
+        } else if (err != ESP_OK) {
+            dap_cmd_err(DAP_ERR_INTERNAL, "finish_failed");
+        } else {
+            dap_cmd_ok("saved crc_ok=1");
+        }
+        return;
+    }
+
+    if (strcmp(sub, "abort") == 0) {
+        dap_store_abort();
+        dap_cmd_ok("aborted");
+        return;
+    }
+
+    dap_cmd_err(DAP_ERR_BADARG, "usage: @FPUT begin|data|end|abort ...");
+}
+
+/* ------------------------------------------------------------------ */
 /* 分发                                                                */
 /* ------------------------------------------------------------------ */
 
@@ -645,6 +926,12 @@ static const cmd_entry_t s_cmds[] = {
     { "AP",      cmd_ap      },
     { "FACTORY", cmd_factory },
     { "REBOOT",  cmd_reboot  },
+    { "FLIST",   cmd_flist   },
+    { "FSTAT",   cmd_fstat   },
+    { "FDEL",    cmd_fdel    },
+    { "FSEL",    cmd_fsel    },
+    { "FNAME",   cmd_fname   },
+    { "FPUT",    cmd_fput    },
 };
 
 static void dispatch_line(char *line) {

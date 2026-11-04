@@ -68,6 +68,9 @@ void      dap_store_abort(void);   /* 放弃本次上传(关文件、删临时) 
 /** 删除槽位。删的是当前槽时,当前标记自动落到最旧(seq 最小)的槽。 */
 esp_err_t dap_store_del(int slot);
 
+/** 改显示名(只动 NVS 索引,不动文件) */
+esp_err_t dap_store_rename(int slot, const char *name);
+
 /** 设为当前烧录文件(全局唯一) */
 esp_err_t dap_store_set_current(int slot);
 
